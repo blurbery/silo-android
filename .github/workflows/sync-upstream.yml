@@ -1,0 +1,122 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "43 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: Silo-Server/silo-android
+  UPSTREAM_BRANCH: main
+  ALERT_TITLE: Automated upstream sync needs attention
+
+jobs:
+  sync:
+    name: Merge, validate, and update main
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out the fork main branch
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream on a temporary branch
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "blurbery"
+          git config user.email "blurbery@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+
+          if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Fork main already contains the latest upstream commit."
+            exit 0
+          fi
+
+          git switch -c "automation/upstream-sync-${GITHUB_RUN_ID}"
+          git merge --no-ff --no-edit "upstream/${UPSTREAM_BRANCH}"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 21
+        if: steps.merge.outputs.changed == 'true'
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        if: steps.merge.outputs.changed == 'true'
+        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6
+
+      - name: Check the build supply chain
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          ./scripts/test-check-build-supply-chain.sh
+          ./scripts/check-build-supply-chain.sh
+
+      - name: Run unit tests
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          ./gradlew \
+            -Dorg.gradle.jvmargs="-Xmx4g -Dfile.encoding=UTF-8" \
+            testDebugUnitTest \
+            --max-workers=2
+
+      - name: Run Android lint
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          ./gradlew \
+            -Dorg.gradle.jvmargs="-Xmx4g -Dfile.encoding=UTF-8" \
+            :android-shared:lintDebug :androidApp:lintDebug :androidTvApp:lintDebug \
+            :androidApp:lintVitalRelease :androidTvApp:lintVitalRelease \
+            --max-workers=2
+
+      - name: Advance fork main after validation
+        if: steps.merge.outputs.changed == 'true'
+        run: git push origin HEAD:main
+
+      - name: Open one alert when sync fails
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          issue_number="$(gh issue list --state open --limit 100 \
+            --json number,title \
+            --jq ".[] | select(.title == env.ALERT_TITLE) | .number" \
+            | head -n 1)"
+          if [[ -z "$issue_number" ]]; then
+            gh issue create \
+              --title "$ALERT_TITLE" \
+              --body "The scheduled merge from \`$UPSTREAM_REPOSITORY:$UPSTREAM_BRANCH\` failed. The fork's \`main\` branch was left unchanged. Review: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          fi
+
+      - name: Close a resolved sync alert
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          issue_number="$(gh issue list --state open --limit 100 \
+            --json number,title \
+            --jq ".[] | select(.title == env.ALERT_TITLE) | .number" \
+            | head -n 1)"
+          if [[ -n "$issue_number" ]]; then
+            gh issue close "$issue_number" \
+              --comment "The automatic upstream sync is healthy again."
