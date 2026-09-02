@@ -1,6 +1,7 @@
 package org.siloserver.silo.tv.ui.screens.player
 
 import android.util.Log
+import androidx.annotation.OptIn
 import androidx.media3.common.util.UnstableApi
 import org.siloserver.silo.common.network.ServerReachabilityMonitor
 import org.siloserver.silo.common.player.PlaybackCapabilityDetector
@@ -379,6 +380,7 @@ class TvVideoPlaybackStarter(
     }
 }
 
+@OptIn(UnstableApi::class)
 internal fun resolveTvInitialAudioTrackIndex(
     requestedAudioIndex: Int?,
     carriedAudioIndex: Int?,
