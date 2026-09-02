@@ -1367,7 +1367,7 @@ fun TvMainShell(
                 }
                 shellComposable(TvMainRoute.Calendar.route) {
                     TvCalendarScreen(
-                        onOpenItemDetail = onOpenItemDetail,
+                        onOpenItemDetailSelection = onOpenItemDetailSelection,
                         onInitialContentFocus = {
                             focusState.closeProfileMenuForContent()
                             calendarFocusHandoffPending = false
@@ -1419,15 +1419,7 @@ fun TvMainShell(
             }
         }
 
-        // Shared one-layer nav shadow. Root artwork no longer draws a second
-        // scrim, so Home and flat shell pages have identical chrome.
-        TvTopMenuDropShadow(
-            visibility = if (currentRoute == TvMainRoute.Settings.route) 0f else menuVisibility.value,
-            modifier = Modifier.align(Alignment.TopCenter),
-        )
-
-        // Menu overlay — content remains visible behind the transparent bar,
-        // matching tvOS without a heavy top-edge shadow.
+        // Menu overlay — content remains visible behind the transparent bar.
         TvTopMenuBar(
             selectedRoot = selectedRoot,
             destinations = visibleRoots,
