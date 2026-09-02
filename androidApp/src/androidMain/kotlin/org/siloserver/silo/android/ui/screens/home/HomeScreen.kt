@@ -4,6 +4,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.asPaddingValues
@@ -15,7 +16,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.foundation.shape.CircleShape
@@ -36,26 +37,31 @@ import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.State
 import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import org.siloserver.silo.android.ui.components.SiloWordmark
+import androidx.compose.ui.unit.sp
+import coil3.imageLoader
+import coil3.request.ImageRequest
 import org.siloserver.silo.android.ui.components.TabTopBarActions
 import org.siloserver.silo.android.ui.components.TopBarIconButton
-import org.siloserver.silo.android.ui.components.topBarGlass
-import dev.chrisbanes.haze.HazeState
-import dev.chrisbanes.haze.hazeSource
-import dev.chrisbanes.haze.rememberHazeState
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.distinctUntilChanged
 import org.siloserver.silo.android.ui.components.EmptyStateView
 import org.siloserver.silo.android.ui.components.ErrorView
 import org.siloserver.silo.android.ui.components.MediaRowSkeleton
@@ -64,33 +70,58 @@ import org.siloserver.silo.android.ui.components.rememberShimmerProgress
 import org.siloserver.silo.android.ui.screens.pairing.CompanionPairingViewModel
 import org.siloserver.silo.android.ui.screens.pairing.CompanionPairingBottomOverlay
 import org.siloserver.silo.android.ui.screens.profiles.ProfileAvatar
+import org.siloserver.silo.common.diagnostics.DiagnosticsHomeContentState
+import org.siloserver.silo.common.diagnostics.DiagnosticsHomeLogger
+import org.siloserver.silo.common.diagnostics.DiagnosticsHomeScrollRegion
+import org.siloserver.silo.common.diagnostics.DiagnosticsListLogger
+import org.siloserver.silo.common.diagnostics.DiagnosticsListSnapshot
+import org.siloserver.silo.common.diagnostics.DiagnosticsListSurface
 import org.siloserver.silo.common.pairing.CompanionPairingStatus
 import org.siloserver.silo.common.pairing.CompanionPairingTarget
 import org.siloserver.silo.common.ui.components.DeferImagePresentationWhileScrolling
 import org.siloserver.silo.common.ui.components.avatarRef
 import org.siloserver.silo.model.catalog.isAudiobookItemType
 import org.siloserver.silo.model.profile.Profile
-import org.siloserver.silo.model.section.splitTopFeatured
+import org.siloserver.silo.model.section.SectionItem
 import org.siloserver.silo.viewmodel.HomeViewModel
 import org.siloserver.silo.android.ui.navigation.LocalBottomChromeInset
+import org.siloserver.silo.android.ui.navigation.LocalHeroSourceHandoff
+import org.siloserver.silo.android.ui.util.rememberDominantColor
+import org.siloserver.silo.network.ServerRegistry
+import org.siloserver.silo.network.ApiResult
+import org.siloserver.silo.repository.CatalogRepository
+import org.koin.compose.koinInject
 import org.koin.compose.viewmodel.koinViewModel
 
-private const val ChromeFadeDistanceDp = 72f
+private data class ContinueWatchingWarmTarget(
+    val seriesId: String,
+    val seasonNumber: Int?,
+    val episodeContentId: String,
+)
+
+private data class WarmedSeriesArtwork(
+    val url: String?,
+    val thumbhash: String?,
+)
 
 /**
  * Phone Home screen.
  *
- * Mirrors iOS `HomeView.swift` (phone) 1:1: the server's featured section is a
- * full-bleed spotlight under the floating native chrome, followed by the
- * resume-first section rows. The hero fades into the OLED page background and
- * is removed from the row feed so the content appears only once.
+ * Mirrors iOS `HomeView.swift` (phone) 1:1: a flat OLED background (no hero —
+ * a `featured` section renders as an ordinary row in its server order; the
+ * phone apps have no hero surface at all), a runway spacer that
+ * reserves room under the floating chrome, the resume-first section rows, and
+ * a floating top chrome (wordmark + search + profile menu) that fades in a
+ * subtle glass surface as content scrolls underneath it. The screen owns its
+ * own top inset so the chrome floats over the status bar.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(
     onItemClick: (String) -> Unit,
+    onContinueWatchingItemClick: (SectionItem) -> Unit,
     onPlayClick: (String, Double?) -> Unit,
-    scrollToTopTick: Int = 0,
+    onBottomNavMinimizedChange: (Boolean) -> Unit = {},
     viewModel: HomeViewModel,
     activeProfile: Profile?,
     onSearchClick: () -> Unit,
@@ -107,6 +138,11 @@ fun HomeScreen(
     modifier: Modifier = Modifier,
 ) {
     val state by viewModel.uiState.collectAsState()
+    val sectionPreferences: HomeSectionPreferencesStore = koinInject()
+    val preferenceRevision by sectionPreferences.revision.collectAsState()
+    val serverRegistry: ServerRegistry = koinInject()
+    val activeServerId by serverRegistry.activeServerId.collectAsState()
+    val activeEntry by serverRegistry.activeEntry.collectAsState()
     val companionPairingViewModel = koinViewModel<CompanionPairingViewModel>()
     val companionTargets by companionPairingViewModel.targets.collectAsState()
     val companionStatus by companionPairingViewModel.status.collectAsState()
@@ -115,18 +151,194 @@ fun HomeScreen(
     var presentedPairingTarget by remember { mutableStateOf<CompanionPairingTarget?>(null) }
     var dismissedPairingSessions by rememberSaveable { mutableStateOf(emptyList<String>()) }
     val sections = state.sections
-    val featuredSplit = remember(sections) { sections.splitTopFeatured() }
-    val featuredSection = featuredSplit.featured
-    // Only an explicitly featured top row is rendered as the phone spotlight.
-    // Featured rows farther down remain in the feed in their configured order.
-    val regularSections = remember(featuredSplit.rest) {
-        featuredSplit.rest.filter { it.items.isNotEmpty() }
+    val profileScopeId = activeEntry?.profileId ?: activeProfile?.id
+    val populatedServerSections = remember(sections) { sections.filter { it.items.isNotEmpty() } }
+    // No hero billboard on phone (matches iOS): a `featured` section is just
+    // another row, rendered in the order the server configured it.
+    val regularSections = remember(
+        sections,
+        preferenceRevision,
+        activeServerId,
+        profileScopeId,
+    ) {
+        sectionPreferences.arrangedSections(sections, profileId = profileScopeId)
     }
-    val hasHomeContent = featuredSection != null || regularSections.isNotEmpty()
+    val context = LocalContext.current
+    val catalogRepository: CatalogRepository = koinInject()
+    val heroHandoff = LocalHeroSourceHandoff.current
+    val continueWatchingWarmTargets = remember(regularSections) {
+        regularSections
+            .asSequence()
+            .filter { section ->
+                section.sectionType == "continue_watching" ||
+                    section.sectionType == "in_progress"
+            }
+            .flatMap { it.items.asSequence() }
+            .mapNotNull { item ->
+                val seriesId = item.seriesId?.takeIf { it.isNotBlank() }
+                if (!item.type.equals("episode", ignoreCase = true) || seriesId == null) {
+                    null
+                } else {
+                    ContinueWatchingWarmTarget(
+                        seriesId = seriesId,
+                        seasonNumber = item.seasonNumber,
+                        episodeContentId = item.contentId,
+                    )
+                }
+            }
+            .distinctBy { it.seriesId }
+            // Warming the visible runway covers the row without turning Home
+            // into an unbounded metadata crawl for very large histories.
+            .take(4)
+            .toList()
+    }
+    var warmedSeriesArtwork by remember(activeServerId, profileScopeId) {
+        mutableStateOf<Map<String, WarmedSeriesArtwork>>(emptyMap())
+    }
+    LaunchedEffect(activeServerId, profileScopeId, continueWatchingWarmTargets) {
+        // Warm each Continue Watching destination in row order. Within one
+        // title, its parent detail, exact episode and selector data run in
+        // parallel. CatalogRepository keeps these calls alive/single-flight if
+        // the user taps while this effect is still awaiting them.
+        for (target in continueWatchingWarmTargets) {
+            coroutineScope {
+                val parentDetail = async {
+                    catalogRepository.warmItemDetail(target.seriesId)
+                }
+                val seasons = async {
+                    catalogRepository.warmSeasons(target.seriesId)
+                }
+                val episodes = async {
+                    target.seasonNumber?.let { seasonNumber ->
+                        catalogRepository.warmEpisodes(target.seriesId, seasonNumber)
+                    }
+                }
+                val episodeDetail = async {
+                    catalogRepository.warmItemDetail(target.episodeContentId)
+                }
+
+                val resolvedParent = when (val result = parentDetail.await()) {
+                    is ApiResult.Success -> result.data
+                    else -> null
+                }
+                if (resolvedParent != null) {
+                    val artwork = WarmedSeriesArtwork(
+                        url = resolvedParent.backdropUrl ?: resolvedParent.posterUrl,
+                        thumbhash = resolvedParent.backdropThumbhash
+                            ?: resolvedParent.posterThumbhash,
+                    )
+                    warmedSeriesArtwork = warmedSeriesArtwork + (target.seriesId to artwork)
+                    artwork.url?.takeIf { it.isNotBlank() }?.let { artworkUrl ->
+                        context.imageLoader.enqueue(
+                            ImageRequest.Builder(context)
+                                .data(artworkUrl)
+                                .size(
+                                    context.resources.displayMetrics.widthPixels.coerceAtLeast(1),
+                                    context.resources.displayMetrics.heightPixels.coerceAtLeast(1),
+                                )
+                                .build(),
+                        )
+                    }
+                }
+                seasons.await()
+                episodes.await()
+                episodeDetail.await()
+            }
+        }
+    }
+    var focusedContinueWatchingItem by remember { mutableStateOf<SectionItem?>(null) }
+    val visibleFocusedItem = remember(focusedContinueWatchingItem, regularSections) {
+        focusedContinueWatchingItem?.takeIf { focused ->
+            regularSections.any { section ->
+                section.items.any { it.contentId == focused.contentId }
+            }
+        }
+    }
+    val tintArtworkUrl = visibleFocusedItem?.backdropUrl ?: visibleFocusedItem?.posterUrl
+    val tintArtworkThumbhash =
+        visibleFocusedItem?.backdropThumbhash ?: visibleFocusedItem?.posterThumbhash
+    val homeTint by rememberDominantColor(
+        imageUrl = tintArtworkUrl,
+        fallback = Color(0xFF0A1F24),
+        thumbhash = tintArtworkThumbhash,
+    )
+    // iOS Home paints the normalized artwork tint itself, then lowers its
+    // brightness slightly. Detail pages intentionally use the darker 42%-over-
+    // black composite; applying that detail formula here made Home too flat.
+    val homeSurface = Color(
+        red = (homeTint.red - 0.055f).coerceAtLeast(0f),
+        green = (homeTint.green - 0.055f).coerceAtLeast(0f),
+        blue = (homeTint.blue - 0.055f).coerceAtLeast(0f),
+        alpha = 1f,
+    )
+    val diagnosticsContentState = when {
+        state.isLoading && regularSections.isEmpty() -> DiagnosticsHomeContentState.LOADING
+        state.error != null && regularSections.isEmpty() -> DiagnosticsHomeContentState.ERROR
+        regularSections.isEmpty() -> DiagnosticsHomeContentState.EMPTY
+        else -> DiagnosticsHomeContentState.READY
+    }
+    LaunchedEffect(diagnosticsContentState) {
+        DiagnosticsHomeLogger.content(diagnosticsContentState)
+    }
+    val diagnosticsListSnapshot = remember(regularSections, state.sectionsFullyResolved) {
+        DiagnosticsListSnapshot.fromKeys(
+            keys = regularSections.map { it.id },
+            rowKeys = regularSections.map { section -> section.items.map { it.contentId } },
+            fullyResolved = state.sectionsFullyResolved,
+        )
+    }
+    LaunchedEffect(diagnosticsListSnapshot, diagnosticsContentState) {
+        if (diagnosticsContentState == DiagnosticsHomeContentState.READY) {
+            DiagnosticsListLogger.snapshot(DiagnosticsListSurface.PHONE_HOME, diagnosticsListSnapshot)
+        }
+    }
 
     val listState = rememberLazyListState()
-    LaunchedEffect(scrollToTopTick) {
-        if (scrollToTopTick > 0) listState.animateScrollToItem(0)
+    val currentDiagnosticsSections by rememberUpdatedState(regularSections)
+    val currentBottomNavCallback by rememberUpdatedState(onBottomNavMinimizedChange)
+    LaunchedEffect(listState) {
+        var previousIndex = listState.firstVisibleItemIndex
+        var previousOffset = listState.firstVisibleItemScrollOffset
+        snapshotFlow {
+            Triple(
+                listState.firstVisibleItemIndex,
+                listState.firstVisibleItemScrollOffset,
+                listState.isScrollInProgress,
+            )
+        }.collect { (index, offset, isScrolling) ->
+            val isAtTop = index == 0 && offset == 0
+            if (isAtTop) {
+                currentBottomNavCallback(false)
+            } else if (isScrolling) {
+                val movingDown = index > previousIndex ||
+                    (index == previousIndex && offset > previousOffset)
+                if (movingDown) currentBottomNavCallback(true)
+            }
+            previousIndex = index
+            previousOffset = offset
+        }
+    }
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress }
+            .distinctUntilChanged()
+            .collect { scrolling ->
+                val currentSections = currentDiagnosticsSections
+                val sectionCount = currentSections.size
+                val firstVisibleItem = listState.firstVisibleItemIndex
+                val visibleRowOrdinal = (firstVisibleItem - 1).takeIf(currentSections.indices::contains)
+                val region = when {
+                    sectionCount == 0 -> DiagnosticsHomeScrollRegion.UNKNOWN
+                    firstVisibleItem <= 1 -> DiagnosticsHomeScrollRegion.TOP
+                    firstVisibleItem >= sectionCount -> DiagnosticsHomeScrollRegion.END
+                    else -> DiagnosticsHomeScrollRegion.CONTENT
+                }
+                DiagnosticsHomeLogger.scroll(
+                    scrolling = scrolling,
+                    region = region,
+                    visibleRowOrdinal = visibleRowOrdinal,
+                    rawSectionType = visibleRowOrdinal?.let { currentSections[it].sectionType },
+                )
+            }
     }
     LaunchedEffect(companionTargets, companionStatus, dismissedPairingSessions) {
         if (companionStatus is CompanionPairingStatus.Idle) {
@@ -145,44 +357,62 @@ fun HomeScreen(
             }
         }
     }
-    val density = LocalDensity.current
-    val chromeFadePx = remember(density) {
-        with(density) { ChromeFadeDistanceDp.dp.toPx() }
-    }
-    val scrollProgress = remember(chromeFadePx) {
-        derivedStateOf {
-            if (listState.firstVisibleItemIndex > 0) {
-                1f
-            } else {
-                (listState.firstVisibleItemScrollOffset / chromeFadePx).coerceIn(0f, 1f)
-            }
-        }
-    }
-
-    // Home's own blur source: the floating chrome blurs the rows scrolling
-    // beneath it. Local rather than the shell's tab-wide source because the
-    // chrome sits inside that source and an effect must not read a source
-    // that contains it.
-    val chromeHaze = rememberHazeState()
-
     // Home can show the same item in several rows at once. Each poster placement
     // now carries a unique hero key (see MediaCard) so duplicates never collide
     // in the shared-transition layout — no per-screen claim registry needed.
     Box(
         modifier = modifier
             .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background),
+            .background(homeSurface),
     ) {
+        Box(
+            modifier = Modifier
+                .matchParentSize()
+                .drawBehind {
+                    drawRect(
+                        brush = Brush.radialGradient(
+                            colorStops = arrayOf(
+                                0.00f to Color.White.copy(alpha = 0.10f),
+                                0.26f to Color.White.copy(alpha = 0.055f),
+                                0.58f to Color.White.copy(alpha = 0.018f),
+                                1.00f to Color.Transparent,
+                            ),
+                            center = Offset(size.width * 0.46f, size.height * 0.48f),
+                            radius = 470.dp.toPx(),
+                        ),
+                    )
+                    drawRect(
+                        brush = Brush.verticalGradient(
+                            colorStops = arrayOf(
+                                0.00f to Color.White.copy(alpha = 0.025f),
+                                0.24f to Color.Transparent,
+                                0.48f to Color.White.copy(alpha = 0.025f),
+                                0.82f to Color.Transparent,
+                                1.00f to Color.White.copy(alpha = 0.012f),
+                            ),
+                        ),
+                    )
+                },
+        )
         when {
-            state.isLoading && !hasHomeContent -> HomeLoadingSkeleton()
-            state.error != null && !hasHomeContent -> ErrorView(
+            state.isLoading && regularSections.isEmpty() -> HomeLoadingSkeleton()
+            state.error != null && regularSections.isEmpty() -> ErrorView(
                 message = state.error ?: "Something went wrong",
                 onRetry = { viewModel.loadSections() },
             )
-            !hasHomeContent -> EmptyStateView(
-                title = "Nothing to watch yet",
-                subtitle = "Add media to your libraries or start watching to see it here.",
-            )
+            regularSections.isEmpty() -> {
+                if (populatedServerSections.isNotEmpty()) {
+                    EmptyStateView(
+                        title = "Home sections are hidden",
+                        subtitle = "Choose which rows appear in Settings → Interface → Home Sections.",
+                    )
+                } else {
+                    EmptyStateView(
+                        title = "Nothing to watch yet",
+                        subtitle = "Add media to your libraries or start watching to see it here.",
+                    )
+                }
+            }
             else -> PullToRefreshBox(
                 isRefreshing = state.isRefreshing,
                 onRefresh = { viewModel.refresh() },
@@ -191,8 +421,7 @@ fun HomeScreen(
                 // the sharp content beneath instead of replacing it.
                 modifier = Modifier
                     .fillMaxSize()
-                    .hazeSource(chromeHaze)
-                    .background(MaterialTheme.colorScheme.background),
+                    .background(Color.Transparent),
             ) {
                 // Feed-scoped: unloaded images hold their thumbhash until the
                 // vertical fling settles (rows add their own horizontal gate).
@@ -200,41 +429,79 @@ fun HomeScreen(
                     LazyColumn(
                         state = listState,
                         modifier = Modifier.fillMaxSize(),
+                        // iOS `sectionSpacing` = SiloTheme.largePadding (24).
+                        verticalArrangement = Arrangement.spacedBy(24.dp),
                     ) {
-                        if (featuredSection != null) {
-                            item(key = "featured:${featuredSection.id}", contentType = "featured-hero") {
-                                MobileFeaturedHero(
-                                    items = featuredSection.items,
-                                    onPlayClick = onPlayClick,
-                                    onInfoClick = onItemClick,
-                                )
-                            }
-                        } else {
-                            // Without a spotlight, reserve runway under the
-                            // floating native chrome for the first row.
-                            item(key = "topRunway") {
-                                Spacer(
-                                    modifier = Modifier
-                                        .windowInsetsPadding(WindowInsets.statusBars)
-                                        .height(64.dp),
+                        // Reserve runway under the floating header so the first row
+                        // doesn't slide under the status-bar chrome. iOS runway =
+                        // topInset + 40 + smallPadding(8) + largePadding(24) +
+                        // smallPadding(8) - headerTopReclaim(16) = topInset + 64.
+                        item(key = "homeIdentity") {
+                            Row(
+                                modifier = Modifier
+                                    .windowInsetsPadding(WindowInsets.statusBars)
+                                    .fillMaxWidth()
+                                    .height(64.dp)
+                                    .padding(horizontal = 16.dp),
+                                verticalAlignment = Alignment.Top,
+                            ) {
+                                Text(
+                                    text = "SILO",
+                                    color = Color.White,
+                                    fontSize = 26.sp,
+                                    lineHeight = 31.sp,
+                                    fontWeight = FontWeight.Black,
+                                    letterSpacing = (26f * 0.34f).sp,
                                 )
                             }
                         }
 
-                        itemsIndexed(
+                        items(
                             items = regularSections,
-                            key = { _, section -> section.id },
-                            contentType = { _, _ -> "section-row" },
-                        ) { index, section ->
+                            key = { it.id },
+                            contentType = { "section-row" },
+                        ) { section ->
+                            val opensUnifiedSeriesDetail =
+                                section.sectionType == "continue_watching" ||
+                                    section.sectionType == "in_progress"
                             HomeSectionRow(
                                 section = section,
-                                // The first row touches the hero's completed
-                                // fade. All subsequent rows keep the standard
-                                // 24 dp Home section rhythm.
-                                modifier = Modifier.padding(
-                                    top = if (featuredSection != null && index == 0) 0.dp else 24.dp,
-                                ),
-                                onItemClick = onItemClick,
+                                onItemClick = { contentId ->
+                                    val item = section.items.firstOrNull { it.contentId == contentId }
+                                    if (opensUnifiedSeriesDetail && item != null) {
+                                        item.seriesId
+                                            ?.takeIf {
+                                                item.type.equals("episode", ignoreCase = true) &&
+                                                    it.isNotBlank()
+                                            }
+                                            ?.let { seriesId ->
+                                                val knownParent = regularSections
+                                                    .asSequence()
+                                                    .flatMap { it.items.asSequence() }
+                                                    .firstOrNull { it.contentId == seriesId }
+                                                val artwork = warmedSeriesArtwork[seriesId]
+                                                    ?: knownParent?.let {
+                                                        WarmedSeriesArtwork(
+                                                            url = it.backdropUrl ?: it.posterUrl,
+                                                            thumbhash = it.backdropThumbhash
+                                                                ?: it.posterThumbhash,
+                                                        )
+                                                    }
+                                                // MediaRow initially hands off the episode
+                                                // still. Replace it with the actual parent
+                                                // series artwork before navigation so the
+                                                // loading frame matches a direct series tap.
+                                                artwork?.let {
+                                                    heroHandoff?.pendingArtworkUrl = it.url
+                                                    heroHandoff?.pendingArtworkThumbhash = it.thumbhash
+                                                }
+                                                heroHandoff?.pendingBrowseContentIds = listOf(seriesId)
+                                            }
+                                        onContinueWatchingItemClick(item)
+                                    } else {
+                                        onItemClick(contentId)
+                                    }
+                                },
                                 onItemPlay = { item ->
                                     // Continue Watching can include audiobooks; the play
                                     // glyph must not drop them into the video player. Home
@@ -256,17 +523,18 @@ fun HomeScreen(
                                         viewModel.dismissContinueWatching(item.contentId, ts)
                                     }
                                 },
+                                onCenteredContinueWatchingItemChanged = { item ->
+                                    if (item?.contentId != focusedContinueWatchingItem?.contentId) {
+                                        focusedContinueWatchingItem = item
+                                    }
+                                },
                             )
                         }
 
                         // iOS bottom padding = SiloTheme.largePadding (24), plus the
                         // translucent bottom chrome the content scrolls beneath.
                         item(key = "bottomPad") {
-                            Spacer(
-                                modifier = Modifier
-                                    .padding(top = 24.dp)
-                                    .height(24.dp + LocalBottomChromeInset.current),
-                            )
+                            Spacer(modifier = Modifier.height(24.dp + LocalBottomChromeInset.current))
                         }
                     }
                 }
@@ -275,8 +543,6 @@ fun HomeScreen(
 
         // Floating top chrome — fades in a glass surface as content scrolls under.
         HomeFloatingChrome(
-            scrollProgress = scrollProgress,
-            hazeState = chromeHaze,
             activeProfile = activeProfile,
             onSearchClick = onSearchClick,
             onRemoteControlClick = onRemoteControlClick,
@@ -334,8 +600,6 @@ private fun HomeLoadingSkeleton() {
 
 @Composable
 private fun HomeFloatingChrome(
-    scrollProgress: State<Float>,
-    hazeState: HazeState,
     activeProfile: Profile?,
     onSearchClick: () -> Unit,
     onRemoteControlClick: () -> Unit,
@@ -350,38 +614,17 @@ private fun HomeFloatingChrome(
     onSignOutClick: () -> Unit,
 ) {
     val statusBarPadding = WindowInsets.statusBars.asPaddingValues()
-    // iOS chrome: progressive glass that fades in as rows scroll under and
-    // feathers out along its bottom edge (same recipe as Libraries), so rows
-    // dissolve into the header rather than meeting a hard line. The glass
-    // extends past the action row so the feather has room on a short bar.
-    // headerTopReclaim(16) pulls the row up beside the status-bar glyphs;
-    // horizontal = SiloTheme.padding(16), bottom = SiloTheme.smallPadding(8).
     Box(modifier = Modifier.fillMaxWidth()) {
-        // Glass fades in with scroll; alpha lives on a graphics layer so the
-        // buttons above stay fully visible at rest. It matches the whole
-        // chrome, i.e. the action row plus the feather runway below it.
-        Box(
-            modifier = Modifier
-                .matchParentSize()
-                .graphicsLayer { alpha = scrollProgress.value }
-                .topBarGlass(hazeState, progressive = true),
-        )
         Box(
             modifier = Modifier
                 .padding(top = statusBarPadding.calculateTopPadding())
-                .padding(start = 16.dp, end = 16.dp, bottom = 8.dp + HomeChromeFeatherExtension)
+                .padding(start = 16.dp, end = 16.dp, bottom = 8.dp)
                 .fillMaxWidth(),
         ) {
-            // Leading: Silo wordmark (iOS SiloWordmarkView width: 72).
-            SiloWordmark(
-                modifier = Modifier
-                    .align(Alignment.CenterStart),
-                width = 72.dp,
-            )
-
-            // Trailing: remote-control + search + profile menu cluster.
+            // The SILO identity scrolls with the feed; only utilities remain pinned.
             TabTopBarActions(
                 modifier = Modifier.align(Alignment.CenterEnd),
+                opaque = true,
                 activeProfile = activeProfile,
                 onSearchClick = onSearchClick,
                 onRequestsClick = onRequestsClick,
@@ -405,6 +648,7 @@ private fun HomeFloatingChrome(
                                 }
                             },
                             isActive = isRemoteControlActive,
+                            opaque = true,
                         ) {
                             Icon(
                                 imageVector = Icons.Outlined.SettingsRemote,
@@ -449,6 +693,3 @@ private fun HomeFloatingChrome(
         }
     }
 }
-
-/** How far the Home chrome's glass runs past its action row to feather out. */
-private val HomeChromeFeatherExtension = 40.dp

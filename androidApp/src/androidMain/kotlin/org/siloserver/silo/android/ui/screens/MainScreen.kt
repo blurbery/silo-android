@@ -23,6 +23,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -46,7 +47,10 @@ import org.siloserver.silo.android.ui.navigation.tabForRoute
 import org.siloserver.silo.android.ui.navigation.tabSwitchNavOptions
 import org.siloserver.silo.android.ui.navigation.bottomMostTabRoute
 import org.siloserver.silo.android.ui.navigation.fallbackMobileTab
+import org.siloserver.silo.android.ui.navigation.scopedLocalDownloadBytes
+import org.siloserver.silo.android.ui.navigation.shouldShowDownloadsTab
 import org.siloserver.silo.android.ui.navigation.visibleMobileTabs
+import org.siloserver.silo.android.ui.navigation.continueWatchingDetailRoute
 import org.siloserver.silo.android.ui.screens.calendar.CalendarScreen
 import org.siloserver.silo.android.ui.screens.home.HomeScreen
 import org.siloserver.silo.android.cast.SiloCastController
@@ -57,16 +61,24 @@ import org.siloserver.silo.android.ui.screens.libraries.LibrariesSelectorSheet
 import org.siloserver.silo.android.ui.screens.libraries.LibrariesViewModel
 import org.siloserver.silo.android.ui.screens.recommendations.ForYouList
 import org.siloserver.silo.android.ui.screens.recommendations.RecommendationsScreen
+import org.siloserver.silo.viewmodel.RecommendationsViewModel
 import org.siloserver.silo.android.ui.screens.recommendations.headerTitle
 import org.siloserver.silo.android.ui.screens.watchtogether.WatchTogetherMenuEntrySheet
 import org.siloserver.silo.cast.SiloCastPlaybackRequest
 import org.siloserver.silo.model.feature.CLIENT_WATCH_TOGETHER_SURFACE_ENABLED
+import org.siloserver.silo.model.navigation.MediaMode
+import org.siloserver.silo.model.navigation.MediaModeCapabilities
+import org.siloserver.silo.model.navigation.mobileMediaModeCapabilities
 import org.siloserver.silo.model.feature.MetadataAiFeatureStore
 import org.siloserver.silo.model.feature.RequestsFeatureStore
 import org.siloserver.silo.common.network.ServerReachabilityMonitor
 import org.siloserver.silo.common.network.ServerReachabilityStatus
+import org.siloserver.silo.common.settings.CardPresentationStore
+import org.siloserver.silo.common.settings.OverlayPrefsStore
+import org.siloserver.silo.network.ApiResult
 import org.siloserver.silo.network.ServerRegistry
 import org.siloserver.silo.repository.AuthRepository
+import org.siloserver.silo.repository.PersonalDataRepository
 import org.siloserver.silo.viewmodel.HomeViewModel
 import kotlinx.coroutines.launch
 import org.koin.compose.koinInject
@@ -121,23 +133,72 @@ fun MainScreen(
         null
     }
     var showLibrarySelector by rememberSaveable(currentTab) { mutableStateOf(false) }
-    // Bumped when the Home tab is re-tapped while already on Home; HomeScreen
-    // reacts by scrolling back to the top.
-    var homeScrollToTopTick by remember { mutableStateOf(0) }
+    var homeBottomNavMinimized by rememberSaveable { mutableStateOf(false) }
 
+    // Entering (or re-entering) any tab starts with the complete tab capsule.
+    // Home alone can minimize it after the user begins scrolling downward.
+    LaunchedEffect(currentTab) {
+        homeBottomNavMinimized = false
+    }
+
+    // Downloads tab visibility: show whenever EITHER the server says there
+    // are records OR we have bytes on disk. The on-disk check is what makes
+    // the tab survive airplane mode — `repository.refresh()` returns an
+    // empty list when offline, but the downloaded files are still there
+    // and we want the user to reach them.
+    val personalDataRepository: PersonalDataRepository = koinInject()
+    val downloadsRepository: org.siloserver.silo.repository.DownloadsRepository = koinInject()
+    val downloadStorage: org.siloserver.silo.common.downloads.DownloadStorage = koinInject()
     val serverRegistry: ServerRegistry = koinInject()
     val authRepository: AuthRepository = koinInject()
     val reachabilityMonitor: ServerReachabilityMonitor = koinInject()
     val requestsFeatureStore: RequestsFeatureStore = koinInject()
     val metadataAiFeatureStore: MetadataAiFeatureStore = koinInject()
+    val overlayPrefsStore: OverlayPrefsStore = koinInject()
+    val cardPresentationStore: CardPresentationStore = koinInject()
     val reachabilityState by reachabilityMonitor.state.collectAsState()
     val requestsEnabled by requestsFeatureStore.isEnabled.collectAsState()
     val reachabilityScope = rememberCoroutineScope()
     val activeEntry by serverRegistry.activeEntry.collectAsState()
-    // Keep the mobile shell stable while profile capabilities and local
-    // download records hydrate. DownloadsScreen handles empty/unavailable
-    // states without adding or removing a bottom-navigation destination.
-    val visibleTabs = remember { visibleMobileTabs() }
+    val mediaCapabilities by produceState(
+        initialValue = MediaModeCapabilities(
+            listOf(
+                MediaMode.Video,
+                MediaMode.Audio,
+                MediaMode.Reading,
+            ),
+        ),
+        personalDataRepository,
+    ) {
+        value = when (val result = personalDataRepository.listUserLibraries()) {
+            is ApiResult.Success -> result.data.mobileMediaModeCapabilities()
+            else -> value
+        }
+    }
+    val downloadRecords by downloadsRepository.records.collectAsState()
+    val activeScopeLocalBytes by produceState(
+        initialValue = 0L,
+        downloadRecords,
+        activeEntry?.id,
+        activeEntry?.profileId,
+        headerState.activeProfile?.id,
+    ) {
+        value = scopedLocalDownloadBytes(
+            storage = downloadStorage,
+            serverId = activeEntry?.id,
+            profileId = activeEntry?.profileId ?: headerState.activeProfile?.id,
+        )
+    }
+    val visibleTabs = remember(mediaCapabilities, downloadRecords, activeScopeLocalBytes) {
+        val hasAnyDownload = shouldShowDownloadsTab(
+            serverRecordCount = downloadRecords.size,
+            activeScopeLocalBytes = activeScopeLocalBytes,
+        )
+        visibleMobileTabs(
+            capabilities = mediaCapabilities,
+            showDownloads = hasAnyDownload,
+        )
+    }
 
     // The shared top bar floats over content; its real height is the status-bar
     // inset plus the fixed bar body. Offset tab content by that so the bar can't
@@ -211,11 +272,30 @@ fun MainScreen(
             authRepository.logout()
             requestsFeatureStore.reset()
             metadataAiFeatureStore.reset()
+            // Per-profile card caches, same teardown the Settings sign-out
+            // does — otherwise the next user's shell renders (and can write
+            // back) the previous profile's overlays and card presentation.
+            overlayPrefsStore.clear()
+            cardPresentationStore.clear()
             navController.navigate(Route.Login.route) {
                 popUpTo(0) { inclusive = true }
                 launchSingleTop = true
             }
         }
+    }
+
+    /**
+     * Profile-menu "Switch Profile". Overlays and card presentation are cached
+     * per profile and the app never backgrounds during an in-app switch, so
+     * drop them here or the next profile keeps rendering — and writing back —
+     * the previous one's values. Navigate first: clearing while the shell is
+     * still composed repaints it with default cards behind the picker (the
+     * TV shell's switch-profile path takes the same order).
+     */
+    fun switchProfileFromMenu() {
+        navController.navigate(Route.ProfileSelection.route)
+        overlayPrefsStore.clear()
+        cardPresentationStore.clear()
     }
     val requestsMenuAction: (() -> Unit)? = if (requestsEnabled) {
         { navController.navigate(Route.Requests.route) }
@@ -238,6 +318,9 @@ fun MainScreen(
     // What For You is actually showing (the empty-feed fallback shows the
     // Watchlist without making it an explicit selection); drives the title.
     var forYouDisplayed by remember { mutableStateOf<ForYouList?>(null) }
+    // Instantiate with the shell, not when the lazy tab is first opened, so
+    // Discover and taste-profile requests run alongside profile/header setup.
+    val recommendationsViewModel = koinViewModel<RecommendationsViewModel>()
     Scaffold(
         bottomBar = {
             // The cast bar rests above the nav menu (iOS tabViewBottomAccessory
@@ -251,11 +334,13 @@ fun MainScreen(
                 )
                 SiloBottomNavBar(
                     currentTab = currentTab,
+                    minimizedToCurrentTab = currentTab == Tab.Home && homeBottomNavMinimized,
                     onTabSelected = { tab ->
                         if (tab == Tab.Home && currentTab == Tab.Home) {
-                            // Re-tapping Home while on Home scrolls it back to the
-                            // top (standard Android bottom-nav convention).
-                            homeScrollToTopTick += 1
+                            // The minimized Home control remains tappable. A
+                            // repeat tap expands the full capsule without
+                            // disturbing the user's feed position.
+                            homeBottomNavMinimized = false
                         } else {
                             navController.navigate(tab.route) {
                                 // Pop to the tab stack's live anchor, not a
@@ -270,7 +355,6 @@ fun MainScreen(
                         }
                     },
                     tabs = visibleTabs,
-                    hazeState = hazeState,
                 )
             }
         },
@@ -303,9 +387,14 @@ fun MainScreen(
                     Tab.Home -> {
                         val homeViewModel = koinViewModel<HomeViewModel>()
                         HomeScreen(
-                            scrollToTopTick = homeScrollToTopTick,
+                            onBottomNavMinimizedChange = { minimized ->
+                                homeBottomNavMinimized = minimized
+                            },
                             onItemClick = { contentId ->
                                 navController.navigate(Route.ItemDetail(contentId).route)
+                            },
+                            onContinueWatchingItemClick = { item ->
+                                navController.navigate(continueWatchingDetailRoute(item))
                             },
                             onPlayClick = { contentId, resumePositionSeconds ->
                                 playVideo(contentId, resumePositionSeconds = resumePositionSeconds)
@@ -326,9 +415,7 @@ fun MainScreen(
                             onRequestsClick = requestsMenuAction,
                             onWatchTogetherClick = watchTogetherMenuAction,
                             onSettingsClick = { navController.navigate(Route.Settings.route) },
-                            onSwitchProfileClick = {
-                                navController.navigate(Route.ProfileSelection.route)
-                            },
+                            onSwitchProfileClick = ::switchProfileFromMenu,
                             onSwitchServerClick = {
                                 navController.navigate(Route.ServerList.route)
                             },
@@ -350,9 +437,7 @@ fun MainScreen(
                             onRequestsClick = requestsMenuAction,
                             onWatchTogetherClick = watchTogetherMenuAction,
                             onSettingsClick = { navController.navigate(Route.Settings.route) },
-                            onSwitchProfileClick = {
-                                navController.navigate(Route.ProfileSelection.route)
-                            },
+                            onSwitchProfileClick = ::switchProfileFromMenu,
                             onSwitchServerClick = {
                                 navController.navigate(Route.ServerList.route)
                             },
@@ -368,6 +453,7 @@ fun MainScreen(
                             onSavedListSelectionChange = { forYouList = it },
                             onDisplayedListChange = { forYouDisplayed = it },
                             contentTopPadding = headerContentTop,
+                            viewModel = recommendationsViewModel,
                         )
                     }
                     Tab.Calendar -> {
@@ -384,9 +470,7 @@ fun MainScreen(
                                     onRequestsClick = requestsMenuAction,
                                     onWatchTogetherClick = watchTogetherMenuAction,
                                     onSettingsClick = { navController.navigate(Route.Settings.route) },
-                                    onSwitchProfileClick = {
-                                        navController.navigate(Route.ProfileSelection.route)
-                                    },
+                                    onSwitchProfileClick = ::switchProfileFromMenu,
                                     onSwitchServerClick = {
                                         navController.navigate(Route.ServerList.route)
                                     },
@@ -445,9 +529,7 @@ fun MainScreen(
                     onRequestsClick = requestsMenuAction,
                     onWatchTogetherClick = watchTogetherMenuAction,
                     onSettingsClick = { navController.navigate(Route.Settings.route) },
-                    onSwitchProfileClick = {
-                        navController.navigate(Route.ProfileSelection.route)
-                    },
+                    onSwitchProfileClick = ::switchProfileFromMenu,
                     onSwitchServerClick = {
                         navController.navigate(Route.ServerList.route)
                     },

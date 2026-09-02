@@ -63,9 +63,14 @@ import kotlinx.coroutines.launch
 import org.siloserver.silo.android.ui.components.MediaCard
 import org.siloserver.silo.android.ui.components.MediaGridDefaults
 import org.siloserver.silo.android.ui.components.rememberBrowseItemCardActions
+import org.siloserver.silo.common.cards.LocalCardPresentation
+import org.siloserver.silo.common.diagnostics.DiagnosticsKeyAnomalyLogger
+import org.siloserver.silo.common.diagnostics.DiagnosticsKeyCollection
+import org.siloserver.silo.common.diagnostics.DiagnosticsListSnapshot
 import org.siloserver.silo.common.ui.components.DeferImagePresentationWhileScrolling
 import org.siloserver.silo.model.catalog.BrowseItem
 import org.siloserver.silo.overlays.OverlayDataExtractor
+import org.siloserver.silo.android.ui.navigation.LocalHeroSourceHandoff
 
 /**
  * A vertical grid of media cards with infinite-scroll support.
@@ -98,7 +103,23 @@ fun CatalogGrid(
     header: (@Composable () -> Unit)? = null,
 ) {
     val gridState = rememberLazyGridState()
-    val cardWidth = viewDensity.minCardWidth
+    val heroHandoff = LocalHeroSourceHandoff.current
+    val browseContentIds = remember(items) { items.map { it.contentId } }
+    val browseOrigin = remember(items.firstOrNull()?.contentId) {
+        "catalog-${items.firstOrNull()?.contentId.orEmpty()}"
+    }
+    // The session density picks the base cell; the server-driven poster-size
+    // preference multiplies it, shifting the adaptive column count.
+    val cardWidth = viewDensity.minCardWidth * LocalCardPresentation.current.posterSize.posterScale
+    val diagnosticsKeySnapshot = remember(items) {
+        DiagnosticsListSnapshot.fromKeys(items.map { it.contentId })
+    }
+    LaunchedEffect(diagnosticsKeySnapshot) {
+        DiagnosticsKeyAnomalyLogger.snapshot(
+            DiagnosticsKeyCollection.PHONE_CATALOG_GRID,
+            diagnosticsKeySnapshot,
+        )
+    }
 
     // Trigger load more when scrolled near bottom. Keyed on the flags: a
     // keyless remember would freeze their first-composition values inside the
@@ -156,10 +177,17 @@ fun CatalogGrid(
                     subtitle = cardSubtitle?.invoke(item),
                     type = item.type,
                     userState = userState,
-                    onClick = { onItemClick(item.contentId) },
+                    onClick = {
+                        heroHandoff?.pendingBrowseContentIds = browseContentIds
+                        heroHandoff?.pendingBrowseOrigin = browseOrigin
+                        heroHandoff?.pendingArtworkUrl = item.backdropUrl ?: item.posterUrl
+                        heroHandoff?.pendingArtworkThumbhash = item.backdropThumbhash ?: item.posterThumbhash
+                        onItemClick(item.contentId)
+                    },
                     width = cardWidth,
                     overlay = OverlayDataExtractor.fromBrowseItem(item),
                     actions = actions,
+                    sharedContentId = item.contentId,
                 )
             }
 

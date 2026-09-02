@@ -25,6 +25,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
@@ -42,6 +43,7 @@ import org.koin.core.parameter.parametersOf
 import org.siloserver.silo.tv.ui.components.TvCatalogGrid
 import org.siloserver.silo.tv.ui.components.TvErrorScreen
 import org.siloserver.silo.tv.ui.components.TvLoadingScreen
+import org.siloserver.silo.tv.ui.components.TvFilterChip
 import org.siloserver.silo.tv.ui.screens.library.TvBrowseControlRow
 import org.siloserver.silo.tv.ui.screens.library.TvBrowseFilterPanel
 import org.siloserver.silo.tv.ui.screens.library.TvBrowseSortPanel
@@ -51,6 +53,7 @@ import org.siloserver.silo.tv.ui.theme.Spacing
 import org.siloserver.silo.tv.ui.theme.sectionEyebrow
 import org.siloserver.silo.tv.ui.theme.tvPageContentPadding
 import org.siloserver.silo.tv.ui.theme.tvPageStartPadding
+import org.siloserver.silo.tv.ui.theme.tvPresetGridColumns
 import org.siloserver.silo.viewmodel.FavoritesViewModel
 import org.siloserver.silo.viewmodel.HistoryViewModel
 import org.siloserver.silo.tv.ui.shell.TvTopMenuLayout
@@ -88,6 +91,14 @@ private const val WatchlistSource = "watchlist"
  * non-audiobook-like value and selects the video facet set.
  */
 private const val PersonalListFacetType = "mixed"
+
+private enum class TvFavoriteMediaKind(
+    val label: String,
+    val mediaType: String,
+) {
+    Movies(label = "Movies", mediaType = "movie"),
+    TvShows(label = "TV Shows", mediaType = "series"),
+}
 
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
@@ -145,18 +156,28 @@ fun TvFavoritesInline(
     firstItemFocusRequester: FocusRequester? = null,
     viewModel: FavoritesViewModel = koinViewModel(),
 ) {
+    var selectedMediaKind by rememberSaveable { mutableStateOf(TvFavoriteMediaKind.Movies) }
     val state by viewModel.uiState.collectAsState()
-    val controls = rememberPersonalListControls(FavoritesSource, viewModel)
+    val controls = rememberPersonalListControls(
+        source = FavoritesSource,
+        listViewModel = viewModel,
+        mediaType = selectedMediaKind.mediaType,
+    )
     PersonalListResumeRefresh(viewModel)
     PersonalInlineGrid(
         state = state,
         controls = controls,
-        emptyMessage = "No favorites yet",
+        emptyMessage = when (selectedMediaKind) {
+            TvFavoriteMediaKind.Movies -> "No favorite movies yet"
+            TvFavoriteMediaKind.TvShows -> "No favorite TV shows yet"
+        },
         emptyIcon = Icons.Filled.Favorite,
         onItemClick = onItemClick,
         onLoadMore = viewModel::loadMore,
         onRetry = viewModel::retry,
         firstItemFocusRequester = firstItemFocusRequester,
+        favoriteMediaKind = selectedMediaKind,
+        onFavoriteMediaKindSelected = { selectedMediaKind = it },
         modifier = modifier,
     )
 }
@@ -225,6 +246,7 @@ fun TvHistoryScreen(
 private fun rememberPersonalListControls(
     source: String,
     listViewModel: PersonalListViewModel,
+    mediaType: String? = null,
 ): TvPersonalListControlsViewModel {
     val sharedOwner = LocalActivity.current as? ViewModelStoreOwner
         ?: LocalViewModelStoreOwner.current
@@ -237,8 +259,8 @@ private fun rememberPersonalListControls(
     val controlsState by controls.uiState.collectAsState()
     // applyQuery no-ops on an unchanged query, so this is safe to re-run on
     // recomposition and on re-entry to the composition.
-    LaunchedEffect(controlsState.query) {
-        listViewModel.applyQuery(controlsState.query)
+    LaunchedEffect(controlsState.query, mediaType) {
+        listViewModel.applyQuery(controlsState.query.copy(mediaType = mediaType))
     }
     return controls
 }
@@ -404,7 +426,7 @@ private fun PersonalGrid(
                     // Match every other catalog grid (browse/person/collections):
                     // the adaptive default rendered ~5 oversized columns here
                     // (QA 2026-07-08).
-                    fixedColumnCount = 6,
+                    fixedColumnCount = tvPresetGridColumns(6),
                     gridState = gridState,
                     restoreItemIndex = restoration.requesterItemIndex,
                     restoreItemFocusRequester = restoreItemFocusRequester,
@@ -466,6 +488,8 @@ private fun PersonalInlineGrid(
     onRetry: () -> Unit,
     modifier: Modifier = Modifier,
     firstItemFocusRequester: FocusRequester? = null,
+    favoriteMediaKind: TvFavoriteMediaKind? = null,
+    onFavoriteMediaKindSelected: ((TvFavoriteMediaKind) -> Unit)? = null,
 ) {
     val controlsState by controls.uiState.collectAsState()
     var openPanel by remember { mutableStateOf<TvPersonalPanel?>(null) }
@@ -507,18 +531,35 @@ private fun PersonalInlineGrid(
                 top = Spacing.md,
                 bottom = Spacing.xl,
             ),
-            fixedColumnCount = 6,
+            fixedColumnCount = tvPresetGridColumns(6),
             firstItemFocusRequester = firstItemFocusRequester.takeIf { !listIsEmpty },
             header = {
-                PersonalControlHeader(
-                    controlsState = controlsState,
-                    total = state.total,
-                    isLoading = state.isLoading,
-                    onSort = { openPanel = TvPersonalPanel.Sort },
-                    onFilter = { openPanel = TvPersonalPanel.Filter },
-                    onClearFilters = controls::clearFilters,
-                    sortPillFocusRequester = firstItemFocusRequester.takeIf { listIsEmpty },
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    if (favoriteMediaKind != null && onFavoriteMediaKindSelected != null) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            TvFavoriteMediaKind.entries.forEach { kind ->
+                                TvFilterChip(
+                                    text = kind.label,
+                                    selected = kind == favoriteMediaKind,
+                                    onClick = { onFavoriteMediaKindSelected(kind) },
+                                    contentPadding = PaddingValues(
+                                        horizontal = 16.dp,
+                                        vertical = 7.dp,
+                                    ),
+                                )
+                            }
+                        }
+                    }
+                    PersonalControlHeader(
+                        controlsState = controlsState,
+                        total = state.total,
+                        isLoading = state.isLoading,
+                        onSort = { openPanel = TvPersonalPanel.Sort },
+                        onFilter = { openPanel = TvPersonalPanel.Filter },
+                        onClearFilters = controls::clearFilters,
+                        sortPillFocusRequester = firstItemFocusRequester.takeIf { listIsEmpty },
+                    )
+                }
             },
             emptyState = {
                 // Inside the grid, not over it: the pills have to stay

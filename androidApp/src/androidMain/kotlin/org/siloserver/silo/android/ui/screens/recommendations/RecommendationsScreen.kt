@@ -35,6 +35,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -50,7 +51,6 @@ import org.siloserver.silo.android.ui.screens.personal.rememberPersonalListContr
 import org.siloserver.silo.viewmodel.PersonalListUiState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -60,6 +60,13 @@ import org.siloserver.silo.viewmodel.RecommendationsViewModel
 import org.siloserver.silo.android.ui.components.MediaRowsSkeleton
 import org.siloserver.silo.android.ui.navigation.LocalBottomChromeInset
 import org.siloserver.silo.common.ui.components.DeferImagePresentationWhileScrolling
+import org.siloserver.silo.common.diagnostics.DiagnosticsListLogger
+import org.siloserver.silo.common.diagnostics.DiagnosticsListSnapshot
+import org.siloserver.silo.common.diagnostics.DiagnosticsListSurface
+import org.siloserver.silo.android.ui.theme.SiloOnOpaqueControl
+import org.siloserver.silo.android.ui.theme.SiloOpaqueControl
+import org.siloserver.silo.android.ui.theme.SiloOpaqueControlBorder
+import org.siloserver.silo.android.ui.theme.SiloOpaqueControlSelected
 import org.koin.compose.viewmodel.koinViewModel
 
 /**
@@ -96,6 +103,20 @@ fun RecommendationsScreen(
     val inFallback = !state.isLoading && state.error == null && state.sections.isEmpty()
     val displayedList = if (inFallback) savedListSelection ?: ForYouList.Watchlist else savedListSelection
     LaunchedEffect(displayedList) { onDisplayedListChange(displayedList) }
+    val diagnosticsListSnapshot = remember(state.sections) {
+        DiagnosticsListSnapshot.fromKeys(
+            keys = state.sections.map { it.id },
+            rowKeys = state.sections.map { section -> section.items.map { it.contentId } },
+        )
+    }
+    LaunchedEffect(diagnosticsListSnapshot, state.isLoading) {
+        if (!state.isLoading && state.sections.isNotEmpty()) {
+            DiagnosticsListLogger.snapshot(
+                DiagnosticsListSurface.PHONE_FOR_YOU,
+                diagnosticsListSnapshot,
+            )
+        }
+    }
 
     // Self-heal the "For You" fallback. The shared VM loads only in init{} and
     // survives tab switches (saveState/restoreState), so an empty server
@@ -375,9 +396,10 @@ private fun SavedShortcutPill(
         onClick = onClick,
         shape = CircleShape,
         contentPadding = PaddingValues(horizontal = 15.dp),
-        border = BorderStroke(1.5.dp, Color.White.copy(alpha = if (selected) 0.9f else 0.3f)),
+        border = BorderStroke(1.dp, SiloOpaqueControlBorder),
         colors = ButtonDefaults.outlinedButtonColors(
-            contentColor = MaterialTheme.colorScheme.onSurface,
+            contentColor = SiloOnOpaqueControl,
+            containerColor = if (selected) SiloOpaqueControlSelected else SiloOpaqueControl,
         ),
         modifier = Modifier.height(40.dp),
     ) {
@@ -395,4 +417,3 @@ private fun SavedShortcutPill(
         )
     }
 }
-

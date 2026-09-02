@@ -60,6 +60,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -76,6 +77,7 @@ import dev.chrisbanes.haze.rememberHazeState
 import org.siloserver.silo.android.ui.components.ErrorView
 import org.siloserver.silo.android.ui.navigation.LocalBottomChromeInset
 import org.siloserver.silo.common.calendar.localDisplayAirTime
+import org.siloserver.silo.common.cards.LocalCardPresentation
 import org.siloserver.silo.common.ui.components.DeferImagePresentationWhileScrolling
 import org.siloserver.silo.common.ui.components.ThumbhashImage
 import org.siloserver.silo.model.calendar.CalendarBadge
@@ -129,6 +131,7 @@ fun CalendarScreen(
     val state by viewModel.uiState.collectAsState()
     val listState = rememberLazyListState()
     val density = LocalDensity.current
+    val locale = LocalConfiguration.current.locales[0]
 
     // The card floats over the agenda; its measured height is the top inset
     // the list scrolls under. Local blur source so the card can be glass.
@@ -219,7 +222,7 @@ fun CalendarScreen(
                         }
                         else -> items(state.weekDates, key = { "day-$it" }) { date ->
                             DayShelf(
-                                heading = sectionHeading(date, today = state.today),
+                                heading = sectionHeading(date, today = state.today, locale = locale),
                                 items = state.itemsFor(date),
                                 onItemClick = onItemClick,
                             )
@@ -232,6 +235,7 @@ fun CalendarScreen(
 
         CalendarHeaderCard(
             state = state,
+            locale = locale,
             hazeModifier = Modifier.hazeEffect(state = haze) {
                 blurRadius = 20.dp
                 noiseFactor = 0f
@@ -269,6 +273,7 @@ fun CalendarScreen(
 @Composable
 private fun CalendarHeaderCard(
     state: CalendarUiState,
+    locale: Locale,
     hazeModifier: Modifier,
     headerActions: @Composable RowScope.() -> Unit,
     onSelectDay: (String) -> Unit,
@@ -299,7 +304,7 @@ private fun CalendarHeaderCard(
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 Text(
-                    text = monthLabel(state.weekDates),
+                    text = monthLabel(state.weekDates, locale),
                     fontSize = 17.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onSurface,
@@ -314,6 +319,7 @@ private fun CalendarHeaderCard(
             }
             CalendarWeekStrip(
                 weekDates = state.weekDates,
+                locale = locale,
                 today = state.today,
                 selectedDay = state.selectedDay,
                 eventCount = { state.itemsFor(it).size },
@@ -445,6 +451,7 @@ private fun CalendarFilterBar(
 @Composable
 private fun CalendarWeekStrip(
     weekDates: List<String>,
+    locale: Locale,
     today: String,
     selectedDay: String,
     eventCount: (String) -> Int,
@@ -466,6 +473,7 @@ private fun CalendarWeekStrip(
             weekDates.forEach { date ->
                 DayCell(
                     date = date,
+                    locale = locale,
                     isSelected = date == selectedDay,
                     isToday = date == today,
                     eventCount = eventCount(date),
@@ -515,6 +523,7 @@ private fun ChevronButton(
 @Composable
 private fun DayCell(
     date: String,
+    locale: Locale,
     isSelected: Boolean,
     isToday: Boolean,
     eventCount: Int,
@@ -522,6 +531,7 @@ private fun DayCell(
     modifier: Modifier = Modifier,
 ) {
     val localDate = remember(date) { LocalDate.parse(date) }
+    val weekdayFormatter = remember(locale) { DateTimeFormatter.ofPattern("EEE", locale) }
     val numberShape = RoundedCornerShape(11.dp)
     Column(
         modifier = modifier
@@ -535,7 +545,7 @@ private fun DayCell(
         verticalArrangement = Arrangement.spacedBy(5.dp),
     ) {
         Text(
-            text = localDate.format(DateTimeFormatter.ofPattern("EEE", Locale.getDefault())),
+            text = localDate.format(weekdayFormatter),
             fontSize = 11.sp,
             fontWeight = FontWeight.SemiBold,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -671,16 +681,21 @@ private fun CalendarEventCard(
     item: CalendarItem,
     onClick: () -> Unit,
 ) {
+    // Poster-size preference scales the whole card; height keeps the 120:198
+    // base ratio. The caption preference gates the title + subtitle block the
+    // same way CalendarEventCard.swift does (showsTitle / showsMetadata).
+    val cardPresentation = LocalCardPresentation.current
+    val posterScale = cardPresentation.posterSize.posterScale
     Column(
         modifier = Modifier
-            .width(PosterCardWidth)
+            .width(PosterCardWidth * posterScale)
             .clickable(onClick = onClick),
         verticalArrangement = Arrangement.spacedBy(4.dp), // iOS VStack spacing = 4
     ) {
         Box(
             modifier = Modifier
-                .width(PosterCardWidth)
-                .height(PosterCardHeight)
+                .width(PosterCardWidth * posterScale)
+                .height(PosterCardHeight * posterScale)
                 .clip(RoundedCornerShape(CornerRadius)),
         ) {
             ThumbhashImage(
@@ -744,23 +759,27 @@ private fun CalendarEventCard(
         }
 
         // Caption: two-line title reserved + context subtitle.
-        Text(
-            text = item.title,
-            fontSize = 14.sp, // iOS siloSubheadline = 14 bold
-            fontWeight = FontWeight.Bold,
-            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f),
-            minLines = 2, // iOS lineLimit(2, reservesSpace: true)
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-        )
-        cardSubtitle(item)?.let { subtitle ->
+        if (cardPresentation.caption.showsTitle) {
             Text(
-                text = subtitle,
-                fontSize = 12.sp, // iOS siloCaption = 12
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
+                text = item.title,
+                fontSize = 14.sp, // iOS siloSubheadline = 14 bold
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f),
+                minLines = 2, // iOS lineLimit(2, reservesSpace: true)
+                maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
             )
+            if (cardPresentation.caption.showsMetadata) {
+                cardSubtitle(item)?.let { subtitle ->
+                    Text(
+                        text = subtitle,
+                        fontSize = 12.sp, // iOS siloCaption = 12
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
         }
     }
 }
@@ -851,21 +870,21 @@ private fun badgeLabel(badge: String): String? = when (badge) {
 }
 
 /** iOS CalendarViewModel.sectionHeading: Today / Tomorrow / "Monday, June 9". */
-private fun sectionHeading(date: String, today: String): String {
+private fun sectionHeading(date: String, today: String, locale: Locale): String {
     val localDate = LocalDate.parse(date)
     if (today.isNotBlank()) {
         val todayDate = LocalDate.parse(today)
         if (localDate == todayDate) return "Today"
         if (localDate == todayDate.plusDays(1)) return "Tomorrow"
     }
-    return localDate.format(DateTimeFormatter.ofPattern("EEEE, MMMM d", Locale.getDefault()))
+    return localDate.format(DateTimeFormatter.ofPattern("EEEE, MMMM d", locale))
 }
 
 /** iOS monthLabel: month + year of the week's Thursday (startDate + 3). */
-private fun monthLabel(weekDates: List<String>): String {
+private fun monthLabel(weekDates: List<String>, locale: Locale): String {
     val anchorStr = weekDates.getOrNull(3) ?: weekDates.firstOrNull() ?: return ""
     val anchor = LocalDate.parse(anchorStr)
-    return anchor.format(DateTimeFormatter.ofPattern("MMMM yyyy", Locale.getDefault()))
+    return anchor.format(DateTimeFormatter.ofPattern("MMMM yyyy", locale))
 }
 
 /** Local viewer time, preferring the server's absolute RFC3339 instant. */

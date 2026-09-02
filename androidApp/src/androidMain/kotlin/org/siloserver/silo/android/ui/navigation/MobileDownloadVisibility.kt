@@ -18,6 +18,11 @@ fun hasLocalDownloadsForScope(
     profileId: String?,
 ): Boolean = scopedLocalDownloadBytes(storage, serverId, profileId) > 0L
 
+fun shouldShowDownloadsTab(
+    serverRecordCount: Int,
+    activeScopeLocalBytes: Long,
+): Boolean = serverRecordCount > 0 || activeScopeLocalBytes > 0L
+
 fun shouldStartOnDownloads(
     hasLocalDownloads: Boolean,
     isDeviceOnline: Boolean,

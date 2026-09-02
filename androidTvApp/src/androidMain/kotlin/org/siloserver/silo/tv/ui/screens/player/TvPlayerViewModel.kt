@@ -20,9 +20,12 @@ import org.siloserver.silo.common.player.PlaybackSessionManager
 import org.siloserver.silo.common.player.PlaybackTeardownGate
 import org.siloserver.silo.common.player.video.MountedAudioTrack
 import org.siloserver.silo.common.player.video.AudioReconcileAction
+import org.siloserver.silo.common.player.video.AudioSelectionWatchdog
+import org.siloserver.silo.common.player.video.AUDIO_TRACK_SELECTION_FAILED_CLASSIFICATION
 import org.siloserver.silo.common.player.video.DesiredAudio
 import org.siloserver.silo.common.player.video.LocalAudioSelection
 import org.siloserver.silo.common.player.video.reconcileDesiredAudioAction
+import org.siloserver.silo.common.player.video.shouldVerifyOriginalAudioSelection
 import org.siloserver.silo.common.player.video.matchMountedAudioTrack
 import org.siloserver.silo.playback.resolveAudioTrackOrdinal
 import org.siloserver.silo.common.player.FinalPlaybackPosition
@@ -59,6 +62,7 @@ import org.siloserver.silo.common.player.video.EpisodeSubtitleMode
 import org.siloserver.silo.common.player.video.ResolvedEpisodeSelection
 import org.siloserver.silo.common.player.video.captureEpisodeSourceIntent
 import org.siloserver.silo.common.player.video.captureEpisodeSubtitleIntent
+import org.siloserver.silo.common.player.video.resolveAudioSelectionAcrossVersions
 import org.siloserver.silo.common.player.normalizedSubtitleCodecFamily
 import org.siloserver.silo.common.player.video.VideoPlayerUiState
 import org.siloserver.silo.common.player.video.resolvedPlaybackDelivery
@@ -931,6 +935,13 @@ class TvPlayerViewModel(
     private var seekSequence = 0L
     private var activeSeekId: Long? = null
     private var hasRenderedFirstFrame = false
+    // Mounted-transport extent reported by the screen's position poll: whether
+    // the current Media3 window is seekable and how far it reaches in
+    // player-local time (-1 = unknown/unset). Feeds
+    // [mountedSeekableSourceRange] so decideSeek can ride the mounted content
+    // for quick skips instead of re-anchoring through the server.
+    private var playerWindowIsSeekable = false
+    private var playerWindowEndPlayerMs = -1L
 
     data class UiState(
         val isLoading: Boolean = true,
@@ -1768,6 +1779,15 @@ class TvPlayerViewModel(
      */
     fun onTransportMountApplied(nonce: Long) {
         if (transportMountGate.applied(nonce)) {
+            // The mounted item was replaced. Facts from the previous
+            // transport's window must not be mapped through the new plan's
+            // timeline offset — that can overstate the new extent and turn a
+            // target the new transport cannot serve into a silent,
+            // wrong-position native seek. The next poll tick (≤500ms)
+            // repopulates from the mounted item; until then the hint is
+            // absent, which at worst costs an unnecessary reanchor.
+            playerWindowIsSeekable = false
+            playerWindowEndPlayerMs = -1L
             pendingNativeSeekAfterMount?.let { targetSeconds ->
                 pendingNativeSeekAfterMount = null
                 // Re-evaluate against the plan that actually won the load;
@@ -1802,6 +1822,8 @@ class TvPlayerViewModel(
     private fun loadContent(
         startPositionOverride: Double? = null,
         preferredFileIdOverride: Int? = null,
+        audioTrackIndexOverride: Int? = null,
+        audioTrackIndexOverrideSpecified: Boolean = false,
         // A missing server session is a renewal, not a new route. Use the
         // lifecycle's adoption-time selection snapshot because Media3 may have
         // already cleared its live tracks by the time the 404 is observed.
@@ -1885,6 +1907,8 @@ class TvPlayerViewModel(
                         resumePositionOverride = startPositionOverride,
                         audioTrackIndex = if (recoveryStartParams != null) {
                             recoveryStartParams.audioTrackIndex
+                        } else if (audioTrackIndexOverrideSpecified) {
+                            audioTrackIndexOverride
                         } else {
                             initialAudioTrackIndex
                         },
@@ -2134,6 +2158,24 @@ class TvPlayerViewModel(
                                 // would see a stale nonce>0 and re-fire a spurious
                                 // second refresh racing the primary mount effect.
                                 subtitleRefreshNonce = 0,
+                                    )
+                                }
+                                val plannedAudioOrdinal = result.playbackPlan
+                                    ?.selectedTracks
+                                    ?.audioIndex
+                                    ?: result.audioTrackIndex
+                                val plannedAudioFileId = result.fileId ?: result.mediaFileId
+                                if (
+                                    plannedAudioFileId != null &&
+                                    plannedAudioOrdinal in result.versions
+                                        .firstOrNull { it.fileId == plannedAudioFileId }
+                                        ?.audioTracks
+                                        .orEmpty()
+                                        .indices
+                                ) {
+                                    primePlannedAudio(
+                                        fileId = plannedAudioFileId,
+                                        catalogOrdinal = plannedAudioOrdinal,
                                     )
                                 }
                                 subtitleTransactions.resetContent(
@@ -2685,6 +2727,28 @@ class TvPlayerViewModel(
         )?.index
     }
 
+    /**
+     * Mounted-transport facts from the screen's 500ms poll (the VM stays free
+     * of MediaController references — the screen owns the player, the same
+     * split as [onPositionChanged]). Read by [mountedSeekableSourceRange] at
+     * seek-commit time. Two staleness rules keep the hint honest:
+     *
+     * - Reports are dropped while [transportMountGate] is suppressing: they
+     *   describe the OLD MediaItem, and mapping them through the new plan's
+     *   timeline offset would overstate the new transport's extent.
+     * - [onTransportMountApplied] clears the facts when a mount wins, so
+     *   until the next poll tick reads the new item the hint is absent and
+     *   ambiguous targets fall back to a server reanchor.
+     *
+     * Within one mounted item a slightly stale window end only ever costs an
+     * unnecessary reanchor, never a wrongly-native seek.
+     */
+    fun onPlayerWindowChanged(isSeekable: Boolean, windowEndPlayerMs: Long) {
+        if (transportMountGate.suppressPositionReports) return
+        playerWindowIsSeekable = isSeekable
+        playerWindowEndPlayerMs = windowEndPlayerMs
+    }
+
     fun onPositionChanged(positionMs: Long, durationMs: Long) {
         if (positionMs < 0) return
         // A new recovery response updates the source/player timeline before Compose can run the
@@ -2820,6 +2884,11 @@ class TvPlayerViewModel(
         )
     }
 
+    private val audioSelectionWatchdog = AudioSelectionWatchdog(
+        scope = viewModelScope,
+        onExpired = ::onAudioSelectionVerificationExpired,
+    )
+
     private val _pendingLocalAudioSelection = MutableStateFlow<LocalAudioSelection?>(null)
 
     /**
@@ -2848,6 +2917,7 @@ class TvPlayerViewModel(
         // for an OLDER decision, and overwrites the pick just made — generation
         // order would encode processing order, not decision order.
         if (explicit) pendingPersistedAudioFingerprint = null
+        audioSelectionWatchdog.reset()
         desiredAudioGeneration += 1
         val state = _uiState.value
         desiredAudio = DesiredAudio(
@@ -2864,6 +2934,31 @@ class TvPlayerViewModel(
     }
 
     /**
+     * Seeds the exact source track the server planned without reconciling it
+     * against track rows left over from the preceding media mount.
+     */
+    private fun primePlannedAudio(fileId: Int, catalogOrdinal: Int) {
+        val current = desiredAudio
+        if (current?.fileId == fileId &&
+            (current.explicit || current.catalogOrdinal == catalogOrdinal)
+        ) {
+            return
+        }
+        audioSelectionWatchdog.reset()
+        desiredAudioGeneration += 1
+        desiredAudio = DesiredAudio(
+            generation = desiredAudioGeneration,
+            catalogOrdinal = catalogOrdinal,
+            explicit = false,
+            fileId = fileId,
+        )
+        _pendingLocalAudioSelection.value = null
+        _uiState.update {
+            it.copy(desiredAudioOrdinal = catalogOrdinal, desiredAudioConfirmed = false)
+        }
+    }
+
+    /**
      * Drives the desired audio towards the player on every track snapshot.
      *
      * The intent is deliberately NOT cleared once read. An empty or partial
@@ -2877,18 +2972,27 @@ class TvPlayerViewModel(
     private fun reconcileDesiredAudio(audio: List<PlayerTrackEntry>) {
         val desired = desiredAudio ?: return
         val state = _uiState.value
+        val mounted = audio.map { it.toMountedAudioTrack() }
+        val requiresMountedIdentity = state.playbackPlan?.delivery == PlaybackDelivery.ORIGINAL_HTTP
         val action = reconcileDesiredAudioAction(
             desired = desired,
             activeFileId = state.selectedFileId ?: state.mediaFileId,
             catalog = catalogAudioTracks(state),
-            mounted = audio.map { it.toMountedAudioTrack() },
+            mounted = mounted,
             selectedOrdinal = audio.firstOrNull { it.isSelected }?.index,
             planAudioOrdinal = state.playbackPlan?.selectedTracks?.audioIndex,
+            requiresMountedIdentity = requiresMountedIdentity,
         )
         when (action) {
-            AudioReconcileAction.None -> Unit
+            AudioReconcileAction.None -> armOriginalAudioSelectionVerification(
+                desired = desired,
+                state = state,
+                mounted = mounted,
+                action = action,
+            )
 
             AudioReconcileAction.DropForeignFile -> {
+                audioSelectionWatchdog.reset()
                 desiredAudio = null
                 _pendingLocalAudioSelection.value = null
                 _uiState.update {
@@ -2897,6 +3001,7 @@ class TvPlayerViewModel(
             }
 
             AudioReconcileAction.Confirm -> {
+                audioSelectionWatchdog.resolve(desired.generation)
                 // Dropped first: the collector would otherwise replay a stale
                 // ordinal against a replacement backend.
                 _pendingLocalAudioSelection.value = null
@@ -2904,6 +3009,12 @@ class TvPlayerViewModel(
             }
 
             is AudioReconcileAction.Apply -> {
+                armOriginalAudioSelectionVerification(
+                    desired = desired,
+                    state = state,
+                    mounted = mounted,
+                    action = action,
+                )
                 localAudioAttempt += 1
                 // Reapplying is not a confirmed state: the row must stop
                 // claiming the track until the player is back on it.
@@ -2917,6 +3028,62 @@ class TvPlayerViewModel(
                 )
             }
         }
+    }
+
+    private fun armOriginalAudioSelectionVerification(
+        desired: DesiredAudio,
+        state: UiState,
+        mounted: List<MountedAudioTrack>,
+        action: AudioReconcileAction,
+    ) {
+        if (shouldVerifyOriginalAudioSelection(
+                desired = desired,
+                delivery = state.playbackPlan?.delivery,
+                planAudioOrdinal = state.playbackPlan?.selectedTracks?.audioIndex,
+                mounted = mounted,
+                action = action,
+            )
+        ) {
+            audioSelectionWatchdog.arm(desired.generation)
+        } else {
+            audioSelectionWatchdog.resolve(desired.generation)
+        }
+    }
+
+    private fun onAudioSelectionVerificationExpired(generation: Long) {
+        val desired = desiredAudio?.takeIf { it.generation == generation } ?: return
+        val state = _uiState.value
+        val mounted = state.audioTracks.map { it.toMountedAudioTrack() }
+        val action = reconcileDesiredAudioAction(
+            desired = desired,
+            activeFileId = state.selectedFileId ?: state.mediaFileId,
+            catalog = catalogAudioTracks(state),
+            mounted = mounted,
+            selectedOrdinal = state.audioTracks.firstOrNull { it.isSelected }?.index,
+            planAudioOrdinal = state.playbackPlan?.selectedTracks?.audioIndex,
+            requiresMountedIdentity = true,
+        )
+        if (!shouldVerifyOriginalAudioSelection(
+                desired = desired,
+                delivery = state.playbackPlan?.delivery,
+                planAudioOrdinal = state.playbackPlan?.selectedTracks?.audioIndex,
+                mounted = mounted,
+                action = action,
+            )
+        ) {
+            audioSelectionWatchdog.resolve(generation)
+            if (action == AudioReconcileAction.Confirm) {
+                reconcileDesiredAudio(state.audioTracks)
+            }
+            return
+        }
+
+        _pendingLocalAudioSelection.value = null
+        startProtocolV3Replan(
+            classification = AUDIO_TRACK_SELECTION_FAILED_CLASSIFICATION,
+            notice = "The requested source audio track could not be mounted and selected.",
+            state = state,
+        )
     }
 
     /** The player is on the wanted track: only now is it the viewer's choice. */
@@ -3109,6 +3276,17 @@ class TvPlayerViewModel(
         if (activeSeekId == null) activeSeekId = ++seekSequence
     }
 
+    /**
+     * Commits a settled seek target (source time) onto the active transport.
+     *
+     * Routing ladder: with no session/plan yet the target parks in
+     * [pendingNativeSeekAfterMount] until the mount wins; with seek recovery
+     * or a mount in flight it queues as a reanchor; otherwise
+     * [decideSeek][org.siloserver.silo.common.player.seek.decideSeek] picks
+     * between a native `Player.seekTo` (fed the mounted transport's proven
+     * extent from [mountedSeekableSourceRange]) and a protocol-V3 server
+     * reanchor. A missing plan timeline falls through to a raw player seek.
+     */
     private fun executeSeekTarget(targetSourceSec: Double) {
         val state = _uiState.value
         if (transportMountGate.suppressPositionReports &&
@@ -3136,7 +3314,13 @@ class TvPlayerViewModel(
             )
             return
         }
-        when (val decision = state.playbackPlan?.timeline?.decideSeek(targetSourceSec)) {
+        val mountedSeekableSourceRange = mountedSeekableSourceRange(state)
+        when (
+            val decision = state.playbackPlan?.timeline?.decideSeek(
+                targetSourceSec,
+                mountedSeekableSourceRange,
+            )
+        ) {
             is PlaybackSeekDecision.ServerReanchor -> {
                 Log.i(
                     TAG,
@@ -3150,12 +3334,33 @@ class TvPlayerViewModel(
                     TAG,
                     "seek_commit seek_id=$activeSeekId action=native " +
                         "target_source_seconds=$targetSourceSec " +
-                        "target_player_seconds=${decision.targetPlayerPositionSeconds}",
+                        "target_player_seconds=${decision.targetPlayerPositionSeconds}" +
+                        (mountedSeekableSourceRange?.let {
+                            " mounted_source_range=${it.start}..${it.endInclusive}"
+                        } ?: ""),
                 )
                 seekRequestChannel.trySend(decision.targetPlayerPositionSeconds)
             }
             null -> seekRequestChannel.trySend(targetSourceSec)
         }
+    }
+
+    /**
+     * Source-time extent the currently mounted transport provably covers, or
+     * null when that cannot be proven. Derived from the Media3 window the
+     * screen polls: a seekable window with a known length can serve any
+     * position it spans as a plain `Player.seekTo`. That covers append-only
+     * (growing) HLS manifests — whose window end is the produced head — and
+     * completed/indexed streams, while a growing progressive copy remux has
+     * no known length and stays excluded. This is what lets quick skips ride
+     * already-mounted content instead of re-anchoring through the server.
+     */
+    private fun mountedSeekableSourceRange(state: UiState): ClosedRange<Double>? {
+        val timeline = state.playbackPlan?.timeline ?: return null
+        if (!playerWindowIsSeekable || playerWindowEndPlayerMs < 0) return null
+        val endSourceSec = timeline.sourcePositionForPlayer(playerWindowEndPlayerMs / 1000.0)
+            ?: return null
+        return timeline.timelineOffsetSeconds..endSourceSec
     }
 
     private fun startSeekReanchor(
@@ -5227,12 +5432,26 @@ class TvPlayerViewModel(
      * fails). Shared by the in-player version switch and by settings whose
      * effect is decided in the server's plan rather than locally.
      *
-     * The audio intent is left alone: it is scoped to the file it was made
-     * against, so reconciliation rejects it once the replacement publishes,
-     * and A keeps its choice if the replacement never arrives.
+     * A manual audio choice is translated by identity onto a different file;
+     * automatic choices are re-resolved from that file's persisted/language
+     * chain. Raw ordinals never cross a file boundary.
      */
     private fun restartSessionInPlace(fileId: Int?) {
         val state = _uiState.value
+        val currentFileId = state.selectedFileId ?: state.mediaFileId
+        val sourceVersion = state.fileVersions.firstOrNull { it.fileId == currentFileId }
+        val targetVersion = state.fileVersions.firstOrNull { it.fileId == fileId }
+        val currentDesired = desiredAudio?.takeIf { it.fileId == currentFileId }
+        val audioTrackIndexOverride = when {
+            fileId == null -> null
+            fileId == currentFileId -> currentDesired?.catalogOrdinal
+            currentDesired?.explicit == true -> resolveAudioSelectionAcrossVersions(
+                sourceTracks = sourceVersion?.audioTracks.orEmpty(),
+                selectedSourceOrdinal = currentDesired.catalogOrdinal,
+                targetTracks = targetVersion?.audioTracks.orEmpty(),
+            )
+            else -> null
+        }
         episodeSelectionHandoffSlot.invalidate()
         resetSeekRecoveryForContentChange()
         transportMountGate.beginLoad()
@@ -5243,6 +5462,8 @@ class TvPlayerViewModel(
             loadContent(
                 startPositionOverride = resumeAt,
                 preferredFileIdOverride = fileId,
+                audioTrackIndexOverride = audioTrackIndexOverride,
+                audioTrackIndexOverrideSpecified = fileId != null,
                 suppressResumeRewind = true,
                 preserveCurrentPlaybackOnFailure = true,
             )
@@ -5394,4 +5615,3 @@ internal fun TvPlayerViewModel.UiState.withoutPlaybackClock(): TvPlayerViewModel
 
 internal fun TvPlayerViewModel.UiState.toPlaybackClock(): PlaybackClock =
     PlaybackClock(position = position, duration = duration)
-

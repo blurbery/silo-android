@@ -88,6 +88,12 @@ import androidx.tv.material3.MaterialTheme
 import androidx.tv.material3.Surface
 import androidx.tv.material3.Text
 import org.siloserver.silo.common.network.clientVersionLabel
+import org.siloserver.silo.common.settings.CardPresentationSource
+import org.siloserver.silo.common.settings.CardPresentationSupport
+import org.siloserver.silo.model.settings.CardCaption
+import org.siloserver.silo.model.settings.CardPosterSize
+import org.siloserver.silo.model.settings.CardPresentation
+import org.siloserver.silo.model.settings.CardPresentationPreset
 import org.siloserver.silo.model.settings.LanguageOptions
 import org.siloserver.silo.domain.player.IntroSkipMode
 import org.siloserver.silo.domain.settings.ProfileSettingsController
@@ -108,6 +114,7 @@ import org.siloserver.silo.tv.ui.theme.FocusedContainer
 import org.siloserver.silo.tv.ui.theme.FocusedContent
 import org.siloserver.silo.tv.ui.theme.Spacing
 import org.koin.compose.viewmodel.koinViewModel
+import org.siloserver.silo.viewmodel.HomeViewModel
 import kotlinx.coroutines.delay
 
 /**
@@ -130,6 +137,7 @@ fun TvSettingsScreen(
     onManageServersReturnFocusConsumed: () -> Unit = {},
     viewModel: TvSettingsViewModel = koinViewModel(),
     diagnosticsViewModel: TvDiagnosticsViewModel = koinViewModel(),
+    homeSectionsViewModel: HomeViewModel = koinViewModel(key = "settings-home-sections"),
 ) {
     val state by viewModel.uiState.collectAsState()
     val diagnosticsState by diagnosticsViewModel.state.collectAsState()
@@ -236,6 +244,7 @@ fun TvSettingsScreen(
         state = state,
         diagnosticsState = diagnosticsState,
         diagnosticsViewModel = diagnosticsViewModel,
+        homeSectionsViewModel = homeSectionsViewModel,
         selectedCategory = selectedCategory,
         categoryFocusRequesters = categoryFocusRequesters,
         detailFocusRequester = detailFocusRequester,
@@ -267,6 +276,9 @@ fun TvSettingsScreen(
         onMetadataLanguageChanged = viewModel::onMetadataLanguageChanged,
         metadataLanguageEnabled = metadataAiStatus.enabled && metadataAiStatus.onView != org.siloserver.silo.model.metadata.MetadataAiOnView.Off,
         onShowForcedSubtitlesChanged = viewModel::onShowForcedSubtitlesChanged,
+        onCardPresentationChanged = viewModel::onCardPresentationSelected,
+        onCardPresentationDeviceOnlyChanged = viewModel::onCardPresentationDeviceOnlyChanged,
+        onUseProfileCardDefault = viewModel::onUseProfileCardDefault,
         onSubtitleFontSizeChanged = viewModel::setSubtitleFontSize,
         onSubtitleFontFamilyChanged = viewModel::setSubtitleFontFamily,
         onSubtitleFontColorChanged = viewModel::setSubtitleFontColor,
@@ -373,6 +385,7 @@ private fun SettingsSplitLayout(
     state: TvSettingsViewModel.UiState,
     diagnosticsState: org.siloserver.silo.common.diagnostics.DiagnosticsUiState,
     diagnosticsViewModel: TvDiagnosticsViewModel,
+    homeSectionsViewModel: HomeViewModel,
     selectedCategory: TvSettingsCategory,
     categoryFocusRequesters: Map<TvSettingsCategory, FocusRequester>,
     detailFocusRequester: FocusRequester,
@@ -405,6 +418,9 @@ private fun SettingsSplitLayout(
     onMetadataLanguageChanged: (String) -> Unit,
     metadataLanguageEnabled: Boolean,
     onShowForcedSubtitlesChanged: (Boolean) -> Unit,
+    onCardPresentationChanged: (CardPresentation) -> Unit,
+    onCardPresentationDeviceOnlyChanged: (Boolean) -> Unit,
+    onUseProfileCardDefault: () -> Unit,
     onSubtitleFontSizeChanged: (SubtitleFontSizePreset) -> Unit,
     onSubtitleFontFamilyChanged: (String) -> Unit,
     onSubtitleFontColorChanged: (String) -> Unit,
@@ -454,6 +470,7 @@ private fun SettingsSplitLayout(
             state = state,
             diagnosticsState = diagnosticsState,
             diagnosticsViewModel = diagnosticsViewModel,
+            homeSectionsViewModel = homeSectionsViewModel,
             selectedCategory = selectedCategory,
             detailFocusRequester = detailFocusRequester,
             onDetailFocusChanged = onDetailFocusChanged,
@@ -477,6 +494,9 @@ private fun SettingsSplitLayout(
             onMetadataLanguageChanged = onMetadataLanguageChanged,
             metadataLanguageEnabled = metadataLanguageEnabled,
             onShowForcedSubtitlesChanged = onShowForcedSubtitlesChanged,
+            onCardPresentationChanged = onCardPresentationChanged,
+            onCardPresentationDeviceOnlyChanged = onCardPresentationDeviceOnlyChanged,
+            onUseProfileCardDefault = onUseProfileCardDefault,
             onSubtitleFontSizeChanged = onSubtitleFontSizeChanged,
             onSubtitleFontFamilyChanged = onSubtitleFontFamilyChanged,
             onSubtitleFontColorChanged = onSubtitleFontColorChanged,
@@ -715,6 +735,7 @@ private fun SettingsDetailPane(
     state: TvSettingsViewModel.UiState,
     diagnosticsState: org.siloserver.silo.common.diagnostics.DiagnosticsUiState,
     diagnosticsViewModel: TvDiagnosticsViewModel,
+    homeSectionsViewModel: HomeViewModel,
     selectedCategory: TvSettingsCategory,
     detailFocusRequester: FocusRequester,
     onDetailFocusChanged: (Boolean) -> Unit,
@@ -739,6 +760,9 @@ private fun SettingsDetailPane(
     onMetadataLanguageChanged: (String) -> Unit,
     metadataLanguageEnabled: Boolean,
     onShowForcedSubtitlesChanged: (Boolean) -> Unit,
+    onCardPresentationChanged: (CardPresentation) -> Unit,
+    onCardPresentationDeviceOnlyChanged: (Boolean) -> Unit,
+    onUseProfileCardDefault: () -> Unit,
     onSubtitleFontSizeChanged: (SubtitleFontSizePreset) -> Unit,
     onSubtitleFontFamilyChanged: (String) -> Unit,
     onSubtitleFontColorChanged: (String) -> Unit,
@@ -777,8 +801,12 @@ private fun SettingsDetailPane(
         when (selectedCategory) {
             TvSettingsCategory.General -> TvGeneralSettingsPane(
                 state = state,
+                homeSectionsViewModel = homeSectionsViewModel,
                 firstFocusRequester = detailFocusRequester,
                 onShowAudiobooksTabChanged = onShowAudiobooksTabChanged,
+                onCardPresentationChanged = onCardPresentationChanged,
+                onCardPresentationDeviceOnlyChanged = onCardPresentationDeviceOnlyChanged,
+                onUseProfileCardDefault = onUseProfileCardDefault,
             )
             TvSettingsCategory.Playback -> TvPlaybackSettingsPane(
                 state = state,
@@ -845,14 +873,81 @@ private fun SettingsDetailPane(
 @Composable
 private fun TvGeneralSettingsPane(
     state: TvSettingsViewModel.UiState,
+    homeSectionsViewModel: HomeViewModel,
     firstFocusRequester: FocusRequester,
     onShowAudiobooksTabChanged: (Boolean) -> Unit,
+    onCardPresentationChanged: (CardPresentation) -> Unit,
+    onCardPresentationDeviceOnlyChanged: (Boolean) -> Unit,
+    onUseProfileCardDefault: () -> Unit,
 ) {
+    var activeCardPicker by remember { mutableStateOf<CardPresentationPicker?>(null) }
+    var showHomeSectionsEditor by remember { mutableStateOf(false) }
+
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         verticalArrangement = Arrangement.spacedBy(10.dp),
         contentPadding = PaddingValues(bottom = Spacing.xxxl),
     ) {
+        item {
+            // Device-local, server/profile-specific visibility and order for
+            // the populated rows returned by Home, matching tvOS General.
+            SettingsGroup(title = "Home Sections") {
+                SettingsValueRow(
+                    label = "Home Sections",
+                    value = "",
+                    onClick = { showHomeSectionsEditor = true },
+                    focusRequester = firstFocusRequester,
+                )
+                SettingsFooterText(
+                    text = "Choose which Home rows are visible and edit the order in which they appear on this Android TV.",
+                )
+            }
+        }
+        item {
+            // tvOS General → CARDS & POSTERS parity, backed by the
+            // server-driven `ui.card_presentation` setting. Unknown support
+            // (offline probe) keeps the controls up over the cached value;
+            // only a confirmed too-old server hides them.
+            SettingsGroup(title = "Cards & Posters") {
+                if (state.cardPresentationSupport == CardPresentationSupport.Unsupported) {
+                    SettingsFooterText(
+                        text = "Update your Silo server to customize media cards.",
+                    )
+                } else {
+                    SettingsValueRow(
+                        label = "Preset",
+                        value = state.cardPresentation.preset?.displayName ?: "Custom",
+                        onClick = { activeCardPicker = CardPresentationPicker.Preset },
+                    )
+                    SettingsValueRow(
+                        label = "Poster Size",
+                        value = state.cardPresentation.posterSize.displayName,
+                        onClick = { activeCardPicker = CardPresentationPicker.PosterSize },
+                    )
+                    SettingsValueRow(
+                        label = "Captions",
+                        value = state.cardPresentation.caption.displayName,
+                        onClick = { activeCardPicker = CardPresentationPicker.Captions },
+                    )
+                    SettingsToggleRow(
+                        label = "Only This Device",
+                        checked = state.cardPresentationSource ==
+                            CardPresentationSource.DeviceOverride,
+                        onCheckedChange = onCardPresentationDeviceOnlyChanged,
+                    )
+                    if (state.cardPresentationSource == CardPresentationSource.ClientFamily) {
+                        SettingsActionRow(
+                            label = "Use Profile Default",
+                            onClick = onUseProfileCardDefault,
+                        )
+                    }
+                    SettingsFooterText(
+                        text = "Choices sync with other TVs signed into this profile " +
+                            "unless \"Only This Device\" is on.",
+                    )
+                }
+            }
+        }
         item {
             // tvOS TVGeneralSettingsPane TOP MENU parity: the Audiobooks tab
             // is opt-in (hidden by default) even when the server has an
@@ -862,7 +957,6 @@ private fun TvGeneralSettingsPane(
                     label = "Show Audiobooks",
                     checked = state.showAudiobooksTab,
                     onCheckedChange = onShowAudiobooksTabChanged,
-                    focusRequester = firstFocusRequester,
                 )
                 SettingsFooterText(
                     text = "Adds an Audiobooks tab to the top menu when your server has an audiobook library. Hidden by default.",
@@ -875,7 +969,71 @@ private fun TvGeneralSettingsPane(
         // (Watchlist/Favorites/History), Home (Browse), and each library's
         // cascade (Collections). (QA 2026-07-08.)
     }
+
+    when (activeCardPicker) {
+        CardPresentationPicker.Preset -> TvSettingsPickerSheet(
+            title = "Preset",
+            // Synthetic "Custom" appears only while the current pair matches
+            // no preset; it is a label for the state, not a choice.
+            options = buildList {
+                CardPresentationPreset.entries.forEach {
+                    add(PickerOption(it.name, it.displayName))
+                }
+                if (state.cardPresentation.preset == null) {
+                    add(PickerOption(CustomCardPresetId, "Custom"))
+                }
+            },
+            selectedId = state.cardPresentation.preset?.name ?: CustomCardPresetId,
+            onSelect = { id ->
+                CardPresentationPreset.entries.firstOrNull { it.name == id }
+                    ?.let { onCardPresentationChanged(it.presentation) }
+                activeCardPicker = null
+            },
+            onDismiss = { activeCardPicker = null },
+        )
+        CardPresentationPicker.PosterSize -> TvSettingsPickerSheet(
+            title = "Poster Size",
+            options = CardPosterSize.entries.map { PickerOption(it.raw, it.displayName) },
+            selectedId = state.cardPresentation.posterSize.raw,
+            onSelect = { id ->
+                CardPosterSize.fromRaw(id)?.let {
+                    onCardPresentationChanged(state.cardPresentation.copy(posterSize = it))
+                }
+                activeCardPicker = null
+            },
+            onDismiss = { activeCardPicker = null },
+        )
+        CardPresentationPicker.Captions -> TvSettingsPickerSheet(
+            title = "Captions",
+            options = CardCaption.entries.map { PickerOption(it.raw, it.displayName) },
+            selectedId = state.cardPresentation.caption.raw,
+            onSelect = { id ->
+                CardCaption.fromRaw(id)?.let {
+                    onCardPresentationChanged(state.cardPresentation.copy(caption = it))
+                }
+                activeCardPicker = null
+            },
+            onDismiss = { activeCardPicker = null },
+        )
+        null -> Unit
+    }
+
+    if (showHomeSectionsEditor) {
+        TvHomeSectionsEditor(
+            onDismiss = { showHomeSectionsEditor = false },
+            viewModel = homeSectionsViewModel,
+        )
+    }
 }
+
+private enum class CardPresentationPicker {
+    Preset,
+    PosterSize,
+    Captions,
+}
+
+/** Picker id for the synthetic "Custom" preset row (never on the wire). */
+private const val CustomCardPresetId = "custom"
 
 @Composable
 private fun TvPlaybackSettingsPane(
@@ -917,14 +1075,6 @@ private fun TvPlaybackSettingsPane(
                     onClick = { activePicker = PlaybackPicker.Quality },
                     focusRequester = firstFocusRequester,
                 )
-                SettingsValueRow(
-                    label = "Audio Language",
-                    value = LanguageOptions.label(
-                        state.audioLanguage,
-                        SettingKeys.PLAYBACK_AUDIO_LANGUAGE,
-                    ),
-                    onClick = { activePicker = PlaybackPicker.AudioLanguage },
-                )
                 // tvOS TVPlaybackSettingsPane STREAMING parity: Dolby Vision
                 // (default on; off plays the HDR10 base layer) with the
                 // narrower Profile 7 fallback nested under it — the P7 row
@@ -945,6 +1095,27 @@ private fun TvPlaybackSettingsPane(
                     label = "Match Content Frame Rate",
                     checked = state.matchContentFrameRate,
                     onCheckedChange = onMatchContentFrameRateChanged,
+                )
+            }
+        }
+        item {
+            SettingsGroup(title = "Audio") {
+                SettingsValueRow(
+                    label = "Preferred Audio Language",
+                    value = LanguageOptions.label(
+                        state.audioLanguage,
+                        SettingKeys.PLAYBACK_AUDIO_LANGUAGE,
+                    ),
+                    onClick = { activePicker = PlaybackPicker.AudioLanguage },
+                )
+                SettingsInfoRow(
+                    label = "Audio Quality",
+                    value = "Best Compatible",
+                )
+                SettingsFooterText(
+                    text = "Uses the preferred language when available, then English. " +
+                        "Within that language, Silo chooses the highest-quality track " +
+                        "supported by this TV and its current audio output.",
                 )
             }
         }
@@ -1015,7 +1186,7 @@ private fun TvPlaybackSettingsPane(
             onDismiss = { activePicker = null },
         )
         PlaybackPicker.AudioLanguage -> TvSettingsPickerSheet(
-            title = "Audio Language",
+            title = "Preferred Audio Language",
             options = audioLanguages.map { PickerOption(it.first, it.second) },
             selectedId = state.audioLanguage,
             onSelect = { onAudioLanguageChanged(it); activePicker = null },

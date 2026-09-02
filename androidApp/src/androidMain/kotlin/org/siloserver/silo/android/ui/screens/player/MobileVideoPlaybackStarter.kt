@@ -6,6 +6,7 @@ import org.siloserver.silo.common.player.PlaybackCapabilityDetector
 import org.siloserver.silo.common.player.PlaybackSessionLifecycle
 import org.siloserver.silo.common.player.PlaybackSessionManager
 import org.siloserver.silo.common.player.StartParams
+import org.siloserver.silo.common.player.TrackSelectionPresets
 import org.siloserver.silo.common.player.VideoSessionStartV3
 import org.siloserver.silo.common.player.video.VideoPlaybackStartRequest
 import org.siloserver.silo.common.player.video.VideoPlaybackStartResult
@@ -84,9 +85,18 @@ internal fun resolveMobileInitialTrackSelection(
     audioTracks: List<org.siloserver.silo.model.catalog.AudioTrack>,
     subtitleTracks: List<SubtitleTrack>,
     persisted: LocalTrackSelection?,
+    preferredAudioLanguage: String? = null,
+    capabilities: ClientCodecCapabilities,
 ): MobileInitialTrackSelection {
     val audioTrackIndex = explicitAudioTrackIndex
         ?: resolveAudioTrackOrdinal(audioTracks, persisted?.audioFingerprint)
+        ?: preferredAudioLanguage?.let { language ->
+            TrackSelectionPresets.selectBestCompatibleAudioTrackOrdinal(
+                tracks = audioTracks,
+                preferredAudioLanguage = language,
+                capabilities = capabilities,
+            )
+        }
     val persistedSubtitleOrdinal = if (explicitSubtitleTrackIndex == null) {
         resolveCatalogSubtitlePreferenceOrdinal(
             subtitleTracks,
@@ -178,7 +188,7 @@ internal class MobileVideoPlaybackStarter(
             // sending the resolution alone lets a capped preset ("1080p Low")
             // stream at the bandwidth the user explicitly declined.
             val maxBitrateKbps = playerSettingsStore.maxBitrateKbpsFlow.first()
-            val preferredAudioLanguage = playerSettingsStore.audioLanguageFlow
+            val configuredAudioLanguage = playerSettingsStore.audioLanguageFlow
                 .first().ifBlank { null }
             val version = request.preferredFileId
                 ?.let { id -> watchDetail.versions.firstOrNull { it.fileId == id } }
@@ -195,14 +205,6 @@ internal class MobileVideoPlaybackStarter(
             } else {
                 null
             }
-            val initialTracks = resolveMobileInitialTrackSelection(
-                explicitAudioTrackIndex = request.audioTrackIndex,
-                explicitSubtitleTrackIndex = request.subtitleTrackIndex,
-                audioTracks = version.audioTracks.orEmpty(),
-                subtitleTracks = version.subtitleTracks.orEmpty(),
-                persisted = persistedTrackSelection,
-            )
-
             val activeProfile = profileRepository.getActiveProfile()
             val profileId = activeProfile?.id ?: profileRepository.getActiveProfileId()
                 ?: return failure(
@@ -210,6 +212,8 @@ internal class MobileVideoPlaybackStarter(
                     "No active profile selected",
                     diagnosticsCode = PlaybackDiagnosticsCode.NO_ACTIVE_PROFILE,
                 )
+            val preferredAudioLanguage = configuredAudioLanguage
+                ?: activeProfile?.language.orNullIfBlank()
             val accessToken = playbackSessionManager.getAccessToken()
                 ?: return failure(
                     request.contentId,
@@ -226,6 +230,15 @@ internal class MobileVideoPlaybackStarter(
                     dolbyVision = dolbyVision,
                     capabilities = capabilities,
                 )
+            val initialTracks = resolveMobileInitialTrackSelection(
+                explicitAudioTrackIndex = request.audioTrackIndex,
+                explicitSubtitleTrackIndex = request.subtitleTrackIndex,
+                audioTracks = version.audioTracks.orEmpty(),
+                subtitleTracks = version.subtitleTracks.orEmpty(),
+                persisted = persistedTrackSelection,
+                preferredAudioLanguage = preferredAudioLanguage,
+                capabilities = capabilities,
+            )
             // Skip-back-on-resume: nudge a genuine resume back a few seconds.
             // Suppressed for Start Over / retry (request flag) and Watch Together
             // (roomId — all participants must land on the synced anchor). The same
@@ -394,7 +407,7 @@ internal class MobileVideoPlaybackStarter(
                     catalogTracks = effectiveVersion?.subtitleTracks.orEmpty(),
                     plannedTracks = resolved.subtitleUrls.orEmpty(),
                 ),
-                preferredAudioLanguage = preferredAudioLanguage ?: activeProfile?.language,
+                preferredAudioLanguage = preferredAudioLanguage,
                 // Server-resolved first, exactly as TvVideoPlaybackStarter does.
                 // The settings screens write these three canonically now
                 // (`PUT /settings/values/{key}?scope=profile`) and nothing

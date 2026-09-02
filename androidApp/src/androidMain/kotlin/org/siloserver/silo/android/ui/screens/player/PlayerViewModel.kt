@@ -92,11 +92,15 @@ import org.siloserver.silo.playback.encodeSubtitleIdentityPreference
 import org.siloserver.silo.playback.nextEpisodeAfter
 import org.siloserver.silo.playback.resolveAudioTrackOrdinal
 import org.siloserver.silo.common.player.video.AudioReconcileAction
+import org.siloserver.silo.common.player.video.AudioSelectionWatchdog
+import org.siloserver.silo.common.player.video.AUDIO_TRACK_SELECTION_FAILED_CLASSIFICATION
 import org.siloserver.silo.common.player.video.DesiredAudio
 import org.siloserver.silo.common.player.video.LocalAudioSelection
 import org.siloserver.silo.common.player.video.MountedAudioTrack
 import org.siloserver.silo.common.player.video.matchMountedAudioTrack
 import org.siloserver.silo.common.player.video.reconcileDesiredAudioAction
+import org.siloserver.silo.common.player.video.resolveAudioSelectionAcrossVersions
+import org.siloserver.silo.common.player.video.shouldVerifyOriginalAudioSelection
 import org.siloserver.silo.playback.selectPlaybackVersion
 import org.siloserver.silo.repository.CatalogRepository
 import org.siloserver.silo.repository.PersonalDataRepository
@@ -1647,6 +1651,7 @@ class PlayerViewModel(
         notice: String,
         state: PlayerUiState,
         diagnostics: Map<String, String> = emptyMap(),
+        audioTrackIndexOverride: Int? = null,
     ) {
         if (recoveryJob?.isActive == true || serverSeekRecoveryInFlight) {
             // Never silently drop a user selection: queue it (newest wins) and
@@ -1671,10 +1676,11 @@ class PlayerViewModel(
                 selectedOrdinal = state.selectedSubtitleIndex,
                 subtitleTracks = state.subtitleTracks,
             )
-            val selectedAudioTrackIndex = selectedServerAudioTrackIndex(
-                selectedOrdinal = state.selectedAudioIndex,
-                audioTracks = state.versions.getOrNull(state.selectedVersionIndex)?.audioTracks.orEmpty(),
-            )
+            val selectedAudioTrackIndex = audioTrackIndexOverride
+                ?: selectedServerAudioTrackIndex(
+                    selectedOrdinal = state.selectedAudioIndex,
+                    audioTracks = state.versions.getOrNull(state.selectedVersionIndex)?.audioTracks.orEmpty(),
+                )
             val dolbyVision = playerSettingsStore.dolbyVisionPolicySnapshot()
             val capabilities = capabilityDetector.detect(dolbyVision = dolbyVision)
             val playbackContext = capabilityDetector.detectPlaybackContext(
@@ -3182,6 +3188,11 @@ class PlayerViewModel(
     private var localAudioAttempt = 0L
     private var mountedAudio: List<MountedAudioTrack> = emptyList()
 
+    private val audioSelectionWatchdog = AudioSelectionWatchdog(
+        scope = viewModelScope,
+        onExpired = ::onAudioSelectionVerificationExpired,
+    )
+
     private val _pendingLocalAudioSelection = MutableStateFlow<LocalAudioSelection?>(null)
 
     /** A mounted track PlayerScreen should select directly on the player. */
@@ -3189,6 +3200,7 @@ class PlayerViewModel(
         _pendingLocalAudioSelection.asStateFlow()
 
     private fun setDesiredAudio(catalogOrdinal: Int, explicit: Boolean) {
+        audioSelectionWatchdog.reset()
         desiredAudioGeneration += 1
         localAudioAttemptCount = 0
         val state = _uiState.value
@@ -3214,6 +3226,7 @@ class PlayerViewModel(
     private fun reconcileDesiredAudio(mounted: List<MountedAudioTrack>, selectedOrdinal: Int?) {
         val desired = desiredAudio ?: return
         val state = _uiState.value
+        val requiresMountedIdentity = state.playbackPlan?.delivery == PlaybackDelivery.ORIGINAL_HTTP
         when (
             val action = reconcileDesiredAudioAction(
                 desired = desired,
@@ -3222,16 +3235,24 @@ class PlayerViewModel(
                 mounted = mounted,
                 selectedOrdinal = selectedOrdinal,
                 planAudioOrdinal = state.playbackPlan?.selectedTracks?.audioIndex,
+                requiresMountedIdentity = requiresMountedIdentity,
             )
         ) {
-            AudioReconcileAction.None -> Unit
+            AudioReconcileAction.None -> armOriginalAudioSelectionVerification(
+                desired = desired,
+                state = state,
+                mounted = mounted,
+                action = action,
+            )
 
             AudioReconcileAction.DropForeignFile -> {
+                audioSelectionWatchdog.reset()
                 desiredAudio = null
                 _pendingLocalAudioSelection.value = null
             }
 
             AudioReconcileAction.Confirm -> {
+                audioSelectionWatchdog.resolve(desired.generation)
                 _pendingLocalAudioSelection.value = null
                 if (!desired.confirmed) {
                     desiredAudio = desired.copy(confirmed = true)
@@ -3240,12 +3261,21 @@ class PlayerViewModel(
             }
 
             is AudioReconcileAction.Apply -> {
-                // AudioTrackManager returns Unit and does nothing silently when
-                // the group has gone, and a no-op produces no callback -- so an
-                // unbounded local path can dead-end with the audio never
-                // applied. After a few snapshots that still have not taken, hand
-                // it to the server instead of retrying forever.
-                if (localAudioAttemptsFor(desired.generation) >= MAX_LOCAL_AUDIO_ATTEMPTS) {
+                val verificationArmed = armOriginalAudioSelectionVerification(
+                    desired = desired,
+                    state = state,
+                    mounted = mounted,
+                    action = action,
+                )
+                // The original-file watchdog covers a plan that promised this
+                // exact source row. Other deliveries, and a newly requested row
+                // that differs from the current plan, still need the bounded
+                // fallback: AudioTrackManager can silently ignore an override
+                // after its group disappears.
+                if (
+                    !verificationArmed &&
+                    localAudioAttemptsFor(desired.generation) >= MAX_LOCAL_AUDIO_ATTEMPTS
+                ) {
                     _pendingLocalAudioSelection.value = null
                     replanForDesiredAudio(desired)
                     return
@@ -3262,6 +3292,64 @@ class PlayerViewModel(
                 )
             }
         }
+    }
+
+    private fun armOriginalAudioSelectionVerification(
+        desired: DesiredAudio,
+        state: PlayerUiState,
+        mounted: List<MountedAudioTrack>,
+        action: AudioReconcileAction,
+    ): Boolean {
+        val shouldVerify = shouldVerifyOriginalAudioSelection(
+            desired = desired,
+            delivery = state.playbackPlan?.delivery,
+            planAudioOrdinal = state.playbackPlan?.selectedTracks?.audioIndex,
+            mounted = mounted,
+            action = action,
+        )
+        if (shouldVerify) {
+            audioSelectionWatchdog.arm(desired.generation)
+        } else {
+            audioSelectionWatchdog.resolve(desired.generation)
+        }
+        return shouldVerify
+    }
+
+    private fun onAudioSelectionVerificationExpired(generation: Long) {
+        val desired = desiredAudio?.takeIf { it.generation == generation } ?: return
+        val state = _uiState.value
+        val action = reconcileDesiredAudioAction(
+            desired = desired,
+            activeFileId = state.mediaFileId,
+            catalog = state.audioTracks,
+            mounted = mountedAudio,
+            selectedOrdinal = selectedMountedAudioOrdinal,
+            planAudioOrdinal = state.playbackPlan?.selectedTracks?.audioIndex,
+            requiresMountedIdentity = true,
+        )
+        if (
+            !shouldVerifyOriginalAudioSelection(
+                desired = desired,
+                delivery = state.playbackPlan?.delivery,
+                planAudioOrdinal = state.playbackPlan?.selectedTracks?.audioIndex,
+                mounted = mountedAudio,
+                action = action,
+            )
+        ) {
+            audioSelectionWatchdog.resolve(generation)
+            if (action == AudioReconcileAction.Confirm) {
+                reconcileDesiredAudio(mountedAudio, selectedMountedAudioOrdinal)
+            }
+            return
+        }
+
+        _pendingLocalAudioSelection.value = null
+        startProtocolV3Replan(
+            classification = AUDIO_TRACK_SELECTION_FAILED_CLASSIFICATION,
+            notice = "The requested source audio track could not be mounted and selected.",
+            state = state,
+            audioTrackIndexOverride = desired.catalogOrdinal,
+        )
     }
 
     /**
@@ -3296,7 +3384,7 @@ class PlayerViewModel(
     private fun localAudioAttemptsFor(generation: Long): Int =
         if (localAudioAttemptGeneration == generation) localAudioAttemptCount else 0
 
-    /** The local switch is not taking; let the server materialise the track. */
+    /** The local switch is not taking; let the server materialize the track. */
     private fun replanForDesiredAudio(desired: DesiredAudio) {
         val state = _uiState.value
         mobileSubtitleTransactions.updatePlaybackContext(mobileSubtitleContext(state))
@@ -4009,12 +4097,28 @@ class PlayerViewModel(
         } else {
             routeIntentState.beginVersionSelection(state.contentId, version.fileId)
         }
+        val currentVersion = state.versions.getOrNull(state.selectedVersionIndex)
+        val carriedAudioIndex = desiredAudio
+            ?.takeIf { desired ->
+                desired.explicit && desired.fileId == currentVersion?.fileId
+            }
+            ?.let { desired ->
+                resolveAudioSelectionAcrossVersions(
+                    sourceTracks = currentVersion?.audioTracks.orEmpty(),
+                    selectedSourceOrdinal = desired.catalogOrdinal,
+                    targetTracks = version.audioTracks.orEmpty(),
+                )
+            }
         viewModelScope.launch {
             sessionLifecycle.stop()
             loadContent(
                 contentId = state.contentId,
                 preferredFileId = version.fileId,
-                initialAudioTrackIndex = state.selectedAudioIndex,
+                // A catalog ordinal belongs to one file. Carry only an
+                // explicit choice that semantically resolves on the target;
+                // otherwise let that file's persisted/language/default chain
+                // decide.
+                initialAudioTrackIndex = carriedAudioIndex,
                 initialSubtitleTrackIndex = state.selectedSubtitleIndex,
                 resumePositionOverride = state.position,
                 suppressResumeRewind = true,
@@ -4376,7 +4480,6 @@ class PlayerViewModel(
     }
 }
 
-/** Snapshots to let a local audio switch take before asking the server. */
 /**
  * How long `isPlaying == false` must hold before it counts as a pause rather
  * than a rebuffer, for the intro prompt's timer. The spec's
@@ -4384,6 +4487,7 @@ class PlayerViewModel(
  */
 private const val PLAYBACK_PAUSE_GRACE_MS = 1_500L
 
+/** Snapshots to let a local audio switch take before asking the server. */
 private const val MAX_LOCAL_AUDIO_ATTEMPTS = 3
 
 internal fun authoritativePlaybackSubtitleOrdinal(
