@@ -1,6 +1,7 @@
 package org.siloserver.silo.android.ui.screens.player
 
 import android.util.Log
+import androidx.media3.common.util.UnstableApi
 import org.siloserver.silo.common.network.ServerReachabilityMonitor
 import org.siloserver.silo.common.player.PlaybackCapabilityDetector
 import org.siloserver.silo.common.player.PlaybackSessionLifecycle
@@ -79,6 +80,7 @@ internal data class MobileInitialTrackSelection(
  * Local/downloaded subtitle identities deliberately resolve to null and stay
  * on the Media3-only restore path after the server plan is mounted.
  */
+@OptIn(UnstableApi::class)
 internal fun resolveMobileInitialTrackSelection(
     explicitAudioTrackIndex: Int?,
     explicitSubtitleTrackIndex: Int?,
