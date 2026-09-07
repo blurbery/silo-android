@@ -7,6 +7,7 @@ import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Build
 import androidx.annotation.OptIn
+import androidx.compose.runtime.RememberObserver
 import androidx.media3.common.C
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.Tracks
@@ -31,6 +32,8 @@ import org.siloserver.silo.model.playback.CLIENT_DV7_TO_HDR10
 import org.siloserver.silo.model.playback.CLIENT_DV_TRANSFORM_RECIPE_VERSION
 import org.siloserver.silo.model.playback.NATIVE_HLS_PLAYBACK_V1_FEATURE
 import org.siloserver.silo.model.playback.CLIENT_SELECTED_AUDIO_TRACK_V1_CLAIM
+import org.siloserver.silo.model.playback.CLIENT_DV8_BASE_LAYER_FALLBACK_V1_CLAIM
+import org.siloserver.silo.model.playback.HdrCapabilities
 import org.siloserver.silo.model.playback.PlaybackDeviceContext
 import org.siloserver.silo.model.playback.PlaybackTransformationExecutor
 import org.siloserver.silo.model.playback.PlaybackTransformationV3
@@ -65,6 +68,12 @@ class PlaybackCapabilityDetector(
      * phone driving the cast, not the receiver.
      */
     val buildIdentity: SiloClientBuildIdentity,
+    /**
+     * Device-level memory of client Dolby Vision transformations that failed
+     * here, consulted before one is advertised again. The player ViewModels
+     * feed it from the failure classification that drove a replan.
+     */
+    val transformQuarantine: DolbyVisionTransformQuarantine = DolbyVisionTransformQuarantine(context),
 ) {
     val outputRouteGeneration: StateFlow<Long> = audioCapabilityManager.outputRouteGeneration
     private val planningSnapshots = PlaybackPlanningSnapshotRegistry(
@@ -74,6 +83,102 @@ class PlaybackCapabilityDetector(
     // MediaCodecList enumeration for callers that need a fresh snapshot later.
     @Volatile
     private var cachedPlatformSoftwareAudioProbe: PlatformSoftwareAudioProbe? = null
+
+    /** Display probe from the most recent [detect], for the output context. */
+    @Volatile
+    private var lastDisplayProbe: DisplayHdrProbeResult? = null
+
+    /**
+     * The display that owns the playback surface. The detector is a process
+     * singleton built on the application context, which can only ever resolve
+     * the default display; the player screens set this when they attach to
+     * their Activity so capability planning, preflight, and the output
+     * context all describe the panel actually showing the video. Null means
+     * "no player attached", which falls back to the default display.
+     */
+    @Volatile
+    var playbackDisplayId: Int? = null
+        private set(value) {
+            field = value
+            // The audio-route manager owns the display-change listener that
+            // rotates the output context; it must watch the same panel.
+            audioCapabilityManager.playbackDisplayId = value
+        }
+
+    /**
+     * Live claims on the playback display, oldest first. The last entry owns
+     * [playbackDisplayId]. Kept as a stack rather than a single owner so a
+     * claim that is released while newer ones exist simply drops out, and a
+     * newest claim that is released hands the display back to the one
+     * beneath it instead of to nothing.
+     */
+    private val playbackDisplayClaims = ArrayList<PlaybackDisplayBinding>(2)
+
+    /**
+     * A claim on the playback display. Two players overlap during a
+     * player-to-player transition, so the display id is owned rather than
+     * assigned: the incoming player binds while the outgoing one is still
+     * composed, and the outgoing player's release must not clear the newer
+     * binding. Each binding releases only itself.
+     *
+     * Release restores the previous live claim. A speculative composition
+     * that binds and is then abandoned while the current player is still
+     * committed would otherwise leave that player's binding retired and the
+     * detector on the default display until something rebinds.
+     *
+     * The binding is a [RememberObserver] because the claim is taken inside
+     * the `remember` factory, before the composition commits. A
+     * `DisposableEffect` cannot clean that up: if the composition is
+     * abandoned before it applies, the effect never enters the composition
+     * and its `onDispose` is never installed. Compose calls [onAbandoned]
+     * in exactly that case and [onForgotten] on ordinary disposal, so a
+     * remembered binding releases itself on both paths without any effect
+     * at the call site.
+     */
+    inner class PlaybackDisplayBinding internal constructor(val displayId: Int?) : RememberObserver {
+        val isActive: Boolean
+            get() = synchronized(this@PlaybackCapabilityDetector) { playbackDisplayClaims.lastOrNull() === this }
+
+        /**
+         * Withdraws this claim. If it owned the display, ownership passes to
+         * the most recent claim still live; if none remains, the display is
+         * cleared. Releasing a claim that is not live is a no-op.
+         */
+        fun release() {
+            synchronized(this@PlaybackCapabilityDetector) {
+                val wasOwner = playbackDisplayClaims.lastOrNull() === this
+                if (!playbackDisplayClaims.remove(this)) return
+                if (wasOwner) playbackDisplayId = playbackDisplayClaims.lastOrNull()?.displayId
+            }
+        }
+
+        override fun onRemembered() = Unit
+        override fun onForgotten() = release()
+        override fun onAbandoned() = release()
+    }
+
+    /**
+     * Binds the display that owns the playback surface and returns the
+     * binding that must be released when that player leaves. Binding always
+     * takes the id, even when another binding is active: the newest player
+     * is the one about to render, and the older binding becomes a no-op on
+     * release unless the newer one goes away first.
+     */
+    fun bindPlaybackDisplay(displayId: Int?): PlaybackDisplayBinding =
+        synchronized(this) {
+            PlaybackDisplayBinding(displayId).also {
+                playbackDisplayClaims.add(it)
+                playbackDisplayId = displayId
+            }
+        }
+
+    /** Decoder-only HDR facts from the most recent [detect], for diagnostics. */
+    @Volatile
+    private var lastDecoderHdr: HdrCapabilities? = null
+
+    /** Decoder-only HDR support independent of the attached display. */
+    val decoderHdrCapabilities: HdrCapabilities?
+        get() = lastDecoderHdr
     /**
      * Inspect the resolved [Tracks] object (emitted by `Player.Listener.onTracksChanged`)
      * and declare whether direct play can proceed. Looks at the selected video
@@ -86,7 +191,10 @@ class PlaybackCapabilityDetector(
      * tracks can be ignored.
      */
     @UnstableApi
-    fun evaluateTracks(tracks: Tracks): Playability {
+    fun evaluateTracks(
+        tracks: Tracks,
+        route: PlannedVideoRoute = PlannedVideoRoute.Unspecified,
+    ): Playability {
         // Video — look for DV profile claims in Format.codecs.
         val selectedVideo = tracks.groups.firstOrNull {
             it.type == C.TRACK_TYPE_VIDEO && it.isSelected
@@ -110,13 +218,23 @@ class PlaybackCapabilityDetector(
                 val profile = dvMatch.groupValues[2].toIntOrNull()
                 if (profile != null) {
                     val codecProbe = MediaCodecCapabilitiesProbe.probe()
-                    val displayHdr = DisplayHdrProbe.probe(context)
+                    val displayHdr = DisplayHdrProbe.probe(context, playbackDisplayId)
                     val supportedHdr = TvPlaybackOutputPolicy.effectiveHdrCapabilities(
                         codec = codecProbe.hdr,
                         display = displayHdr,
                     )
-                    val supported = isDirectPlayableDolbyVisionProfile(profile, supportedHdr)
-                    if (!supported) return Playability.UnsupportedDvProfile(profile)
+                    // Preflight validates the plan the server actually
+                    // issued, not the source's native format. A plan that
+                    // promised a Profile 8 base-layer route is checked
+                    // against that base range; only a plan promising native
+                    // Dolby Vision (or no plan at all) requires the decoder
+                    // and the active output to carry the DV profile.
+                    val verdict = evaluateDolbyVisionRoute(
+                        profile = profile,
+                        route = route,
+                        nativeHdr = supportedHdr,
+                    )
+                    if (verdict != Playability.Supported) return verdict
                 }
             }
         }
@@ -219,22 +337,17 @@ class PlaybackCapabilityDetector(
     ): ClientCodecCapabilities {
         val audioRoute = audioCapabilityManager.playbackRouteSnapshot()
         val codecProbe = MediaCodecCapabilitiesProbe.probe()
-        val displayHdr = DisplayHdrProbe.probe(context)
+        val displayProbe = DisplayHdrProbe.probeDetailed(context, playbackDisplayId)
         // With Dolby Vision off, stop advertising DV profiles (except 5,
         // which has no watchable base layer) so the server plans base-layer /
         // HDR10 delivery and local direct-play checks agree. Single decision
         // source: DolbyVisionPolicy (Apple parity, silo-apple e9bd775).
         val intersectedHdr = TvPlaybackOutputPolicy.effectiveHdrCapabilities(
             codec = codecProbe.hdr,
-            display = displayHdr,
-        ).let { hdr ->
-            hdr.copy(
-                dolbyVisionProfiles = DolbyVisionPolicy.advertisableProfiles(
-                    hdr.dolbyVisionProfiles,
-                    dolbyVision,
-                ),
-            )
-        }
+            display = displayProbe.hdr,
+        ).withDolbyVisionPolicy(dolbyVision)
+        lastDisplayProbe = displayProbe
+        lastDecoderHdr = codecProbe.hdr.withDolbyVisionPolicy(dolbyVision)
 
         val platformAudio = detectPlatformSoftwareAudioCodecs()
         val ffmpegAudio = if (ffmpegAvailable) {
@@ -300,8 +413,20 @@ class PlaybackCapabilityDetector(
         ffmpegAvailable: Boolean = FfmpegAudioSupport.isAvailable(),
         dolbyVision: DolbyVisionPolicy.Snapshot = DolbyVisionPolicy.Snapshot(),
         capabilities: ClientCodecCapabilities? = null,
+        /**
+         * Whether a hardware HEVC decoder reports an HDR10 profile. Null
+         * resolves it from the process-cached codec probe after [capabilities]
+         * is settled, so a fresh detector and injected capabilities both read
+         * the same evidence. Tests inject a value to bypass the probe.
+         */
+        hardwareHevcHdr10Decoder: Boolean? = null,
     ): ClientPlaybackContext {
         val caps = capabilities ?: detect(ffmpegAvailable, dolbyVision)
+        // Resolved after capability selection: the probe is static for the
+        // process, so this cannot go stale against injected capabilities the
+        // way a per-detector field populated only by detect() could.
+        val hevcHdr10Decoder = hardwareHevcHdr10Decoder
+            ?: MediaCodecCapabilitiesProbe.probe().hevcHdr10Decoder
         val audioRoute = planningSnapshots.resolve(
             capabilities = caps,
             currentRoute = audioCapabilityManager.playbackRouteSnapshot(),
@@ -314,6 +439,11 @@ class PlaybackCapabilityDetector(
         val clientVideoTransformations = advertisedClientDolbyVisionTransformations(
             hdrDetails = caps.hdrDetails,
             nativeRpuConverterAvailable = NativeDolbyVisionRpuConverter.isAvailable,
+            hardwareProfile8Decoder = hasHardwareDolbyVisionProfile8Decoder(caps),
+            displayConfirmsDolbyVision = displayConfirmsDolbyVision(lastDisplayProbe),
+            hardwareHevcHdr10Decoder = hevcHdr10Decoder && hasHardwareHevcMain10Decoder(caps),
+            hdr10TransformRouteEnabled = clientDv7ToHdr10RouteEnabled(formFactor),
+            quarantined = transformQuarantine.quarantined(),
         )
         return ClientPlaybackContext(
             formFactor = formFactor,
@@ -335,14 +465,20 @@ class PlaybackCapabilityDetector(
                 platformDetails = androidPlatformDetails(),
             ),
             output = PlaybackOutputContext(
+                // Native-output authority: decoder ∩ active display, with the
+                // decoder's per-profile bounds. Stays the intersection so an
+                // older server keeps reading the same meaning it always has.
                 hdrDetails = caps.hdrDetails,
                 audioPassthrough = passthrough,
                 currentSink = if (passthrough?.passthroughCodecs?.isNotEmpty() == true) "passthrough_sink" else "local_output",
                 sinkType = audioRoute.sinkType,
                 // Opaque to the server, which only ever compares it for
-                // equality. Android's route generation counter is exactly that:
-                // it changes when the audio route changes and nothing else.
+                // equality. Android's route generation counter changes when
+                // the audio route or the display's HDR capabilities change.
                 outputContextId = audioRoute.routeGeneration.toString(),
+                // Raw display facts with their evidence tier so a new server
+                // can distinguish a confirmed SDR panel from a failed probe.
+                display = (lastDisplayProbe ?: DisplayHdrProbe.probeDetailed(context, playbackDisplayId)).toOutputDisplay(),
             ),
             deliveries = mapOf(
                 DELIVERY_CLASS_ORIGINAL_HTTP to DeliveryCapability(
@@ -355,6 +491,11 @@ class PlaybackCapabilityDetector(
                     maxChannels = passthrough?.maxChannels,
                     hdrDetails = caps.hdrDetails,
                     subtitles = DeliverySubtitleCapabilities(
+                        nativeEmbedded = listOf(org.siloserver.silo.model.playback.NativeEmbeddedSubtitleCapability(
+                            container = "mp4",
+                            codecs = listOf("mov_text"),
+                            trackIdentity = "container_track_id",
+                        )),
                         embeddedText = true,
                         sidecarText = true,
                         assStyling = libassDirectFidelity,
@@ -381,7 +522,20 @@ class PlaybackCapabilityDetector(
                     // the mounted Media3 inventory and verifies the resulting
                     // selection. A bounded typed failure-recovery replan is
                     // emitted if the untouched file cannot honor the mapping.
-                    validatedClaims = listOf(CLIENT_SELECTED_AUDIO_TRACK_V1_CLAIM),
+                    validatedClaims = buildList {
+                        add(CLIENT_SELECTED_AUDIO_TRACK_V1_CLAIM)
+                        // Profile 8 base-layer fallback: the renderer routes a
+                        // single-layer DV stream to an ordinary HEVC decoder
+                        // when the plan names a base range, and preflight
+                        // verifies the decoder and output before playback.
+                        // Gated on the same decoder ∩ display facts preflight
+                        // uses (an HDR10 or HLG range the HEVC path can carry
+                        // on this output), so a claim can never be issued
+                        // that preflight would immediately refuse.
+                        if (canAdvertiseDv8BaseLayerFallback(caps, lastDisplayProbe)) {
+                            add(CLIENT_DV8_BASE_LAYER_FALLBACK_V1_CLAIM)
+                        }
+                    },
                 ),
                 DELIVERY_CLASS_PROGRESSIVE to DeliveryCapability(
                     enabled = false,
@@ -613,26 +767,48 @@ internal fun advertisedAudioDecodeCodecs(
 /**
  * Client-side Dolby Vision transformations safe to expose to the v3 planner.
  *
- * A packaged converter and a compatible output range are prerequisites, not
- * end-to-end evidence. In particular, the SM-F976U1 can decode HDR10 and run
- * the packaged RPU bridge, yet a transformed Profile 7 stream renders one
- * frame and then makes no forward progress. Advertising the transformation in
- * that state makes every fresh session select the same unusable route before
- * runtime recovery can ask the server for its validated transformation.
+ * Profile 7 to Profile 8.1 is advertised from runtime evidence that names the
+ * whole path the transformed stream takes: the packaged RPU converter, a
+ * hardware `video/dolby-vision` decoder that lists Profile 8, and a panel
+ * that confirmed Dolby Vision with exact evidence. The decoder ∩ display
+ * intersection in [hdrDetails] carries the last two, but on its own it is not
+ * enough: a device can meet it and still fail. The SM-F976U1 decoded HDR10,
+ * ran the RPU bridge, rendered one frame of a transformed stream, and then
+ * made no forward progress, and while the transformation stayed advertised
+ * every fresh session picked the same route. The startup stall detector now
+ * classifies that wedge as `dv7_transform_stall`, the replan asks the server
+ * for its own recipe, and [DolbyVisionTransformQuarantine] withdraws the
+ * advertisement on this device build so the next session never tries it.
  *
- * Keep the default evidence set empty. A transformation may be added only
- * after the playback fixture matrix validates the complete extractor,
- * transformation, decoder, and display path for the Android device class.
+ * Profile 7 to HDR10 needs no RPU conversion: the transformer drops the
+ * enhancement layer and RPU and hands the untouched HDR10 base layer to an
+ * ordinary HEVC decoder under PQ signalling. It is advertised when the
+ * decoder ∩ display intersection carries HDR10 (which requires exact display
+ * evidence), a hardware HEVC decoder itself reports an HDR10 profile (the
+ * intersection's HDR10 flag is aggregated across HEVC and AV1, so it alone
+ * could be vouched for by an AV1 decoder the route never uses), and
+ * [hdr10TransformRouteEnabled] says the device class runs the recipe. Without
+ * this route, a Profile 7 title on a non-DV output is forced onto a server HLS
+ * remux, and HLS cannot carry TrueHD or DTS: the viewer loses lossless audio
+ * and Atmos to a server AAC conversion even though the HDMI sink accepts the
+ * bitstream. The same [DolbyVisionTransformQuarantine] and stall detector
+ * cover this recipe, so a device that wedges falls back to the server strip.
  */
 internal fun advertisedClientDolbyVisionTransformations(
     hdrDetails: org.siloserver.silo.model.playback.HdrCapabilities?,
     nativeRpuConverterAvailable: Boolean,
-    fixtureValidatedTransformations: Set<String> = emptySet(),
+    hardwareProfile8Decoder: Boolean = false,
+    displayConfirmsDolbyVision: Boolean = false,
+    hardwareHevcHdr10Decoder: Boolean = false,
+    hdr10TransformRouteEnabled: Boolean = false,
+    quarantined: Set<String> = emptySet(),
 ): List<PlaybackTransformationV3> = buildList {
     if (
-        CLIENT_DV7_TO_DV81 in fixtureValidatedTransformations &&
+        CLIENT_DV7_TO_DV81 !in quarantined &&
         8 in hdrDetails?.dolbyVisionProfiles.orEmpty() &&
-        nativeRpuConverterAvailable
+        nativeRpuConverterAvailable &&
+        hardwareProfile8Decoder &&
+        displayConfirmsDolbyVision
     ) {
         add(
             PlaybackTransformationV3(
@@ -648,7 +824,9 @@ internal fun advertisedClientDolbyVisionTransformations(
         )
     }
     if (
-        CLIENT_DV7_TO_HDR10 in fixtureValidatedTransformations &&
+        CLIENT_DV7_TO_HDR10 !in quarantined &&
+        hdr10TransformRouteEnabled &&
+        hardwareHevcHdr10Decoder &&
         hdrDetails?.hdr10 == true
     ) {
         add(
@@ -677,6 +855,161 @@ internal fun isDirectPlayableDolbyVisionProfile(
     profile: Int,
     supportedHdr: org.siloserver.silo.model.playback.HdrCapabilities,
 ): Boolean = supportedHdr.dolbyVisionProfiles.contains(profile)
+
+/**
+ * The base-layer claim is only truthful when preflight would accept the plan
+ * it produces, using the same decoder ∩ display facts that
+ * [PlaybackCapabilityDetector.evaluateTracks] checks:
+ *
+ * - a 10-bit hardware HEVC decoder, and
+ * - either an HDR10 or HLG range in the intersection (for compat 1/4/6
+ *   bases), or a confirmed SDR display (for a compat 2 SDR base, which the
+ *   Main10 path presents without any HDR signalling).
+ *
+ * A decoder that reports only the plain Main10 profile on an HDR panel earns
+ * no HDR range from the codec probe and therefore no claim, instead of a
+ * claim that fails on the first track change. An unknown display probe never
+ * earns the claim: the server would fail closed on it anyway.
+ */
+internal fun canAdvertiseDv8BaseLayerFallback(
+    caps: ClientCodecCapabilities,
+    display: DisplayHdrProbeResult?,
+): Boolean {
+    if (!hasHardwareHevcMain10Decoder(caps)) return false
+    val hdr = caps.hdrDetails ?: HdrCapabilities()
+    if (hdr.hdr10 || hdr.hlg) return true
+    val panel = display as? DisplayHdrProbeResult.Exact ?: return false
+    return !panel.hdr.hdr10 && !panel.hdr.hlg && panel.hdr.dolbyVisionProfiles.isEmpty()
+}
+
+/**
+ * A hardware HEVC decoder that accepts 10-bit input. Both base-layer routes
+ * (the Profile 8 fallback and the Profile 7 to HDR10 transform) hand a
+ * Main 10 PQ stream to this decoder, so a software or 8-bit-only decoder is
+ * not evidence the route can render.
+ */
+internal fun hasHardwareHevcMain10Decoder(caps: ClientCodecCapabilities): Boolean =
+    caps.videoDecode.any { it.codec == "hevc" && 10 in it.bitDepths && it.hardware }
+
+/**
+ * Whether this form factor runs the client Profile 7 to HDR10 recipe.
+ *
+ * TV is the population that pays for the missing route: it sits behind an
+ * HDMI sink that accepts TrueHD and DTS bitstreams, and the alternative HLS
+ * remux converts that audio to AAC. Phones and tablets have no passthrough
+ * sink, so the server strip costs them nothing but a remux, and the one
+ * device that wedged on a client Dolby Vision transform (SM-F976U1) was a
+ * phone. They stay on the server recipe until the fixture matrix covers them.
+ */
+internal fun clientDv7ToHdr10RouteEnabled(formFactor: String): Boolean =
+    formFactor.equals("tv", ignoreCase = true)
+
+/**
+ * A hardware `video/dolby-vision` decoder that lists Profile 8. The Profile 7
+ * to 8.1 recipe hands the converted stream to this decoder under a `dvhe.08`
+ * codec string, so the software fallbacks Media3 would otherwise pick are not
+ * evidence the route can render.
+ */
+internal fun hasHardwareDolbyVisionProfile8Decoder(caps: ClientCodecCapabilities): Boolean =
+    caps.videoDecode.any { it.codec == "dolby_vision" && it.hardware && "profile 8" in it.profiles }
+
+/**
+ * The panel itself reported Dolby Vision with exact evidence. An unknown probe
+ * or a panel that reports only HDR10 cannot carry a Profile 8.1 presentation
+ * however capable the decoder is.
+ */
+internal fun displayConfirmsDolbyVision(display: DisplayHdrProbeResult?): Boolean =
+    (display as? DisplayHdrProbeResult.Exact)?.hdr?.dolbyVisionProfiles?.contains(8) == true
+
+private fun HdrCapabilities.withDolbyVisionPolicy(dolbyVision: DolbyVisionPolicy.Snapshot): HdrCapabilities {
+    val profiles = DolbyVisionPolicy.advertisableProfiles(dolbyVisionProfiles, dolbyVision)
+    return copy(
+        dolbyVisionProfiles = profiles,
+        dolbyVisionProfileLevels = dolbyVisionProfileLevels.filter { it.profile in profiles },
+    )
+}
+
+/**
+ * The video presentation the active plan promised, as far as preflight needs
+ * to know. [Unspecified] keeps the historical behaviour: a Dolby Vision track
+ * must be natively supported by decoder and display.
+ */
+sealed class PlannedVideoRoute {
+    /** No plan context (local file, legacy session); require native support. */
+    data object Unspecified : PlannedVideoRoute()
+
+    /** The plan promises native Dolby Vision output. */
+    data object NativeDolbyVision : PlannedVideoRoute()
+
+    /**
+     * The plan authorised the client Profile 8 base-layer fallback and
+     * promised [baseRange] (`hdr10`, `hlg`, or `sdr`) on the output.
+     */
+    data class DolbyVisionProfile8BaseLayer(val baseRange: String) : PlannedVideoRoute()
+
+    /**
+     * The plan expects a non-DV presentation of the same file (for example a
+     * client Profile 7 transformation); Dolby Vision in the track is expected
+     * and validated elsewhere.
+     */
+    data object ClientTransformed : PlannedVideoRoute()
+}
+
+/**
+ * Preflight verdict for a selected Dolby Vision track under [route].
+ *
+ * A base-layer plan is valid only for Profile 8 and only while the active
+ * output still supports the promised base range; otherwise it reports a typed
+ * failure that the replan ladder can act on. A native plan requires the
+ * decoder ∩ display intersection to carry the profile.
+ */
+internal fun evaluateDolbyVisionRoute(
+    profile: Int,
+    route: PlannedVideoRoute,
+    nativeHdr: HdrCapabilities,
+): Playability = when (route) {
+    is PlannedVideoRoute.DolbyVisionProfile8BaseLayer -> when {
+        profile != 8 -> Playability.DvBaseLayerMetadataMismatch(profile, route.baseRange)
+        !baseRangeSupported(route.baseRange, nativeHdr) ->
+            Playability.DvBaseLayerOutputMismatch(profile, route.baseRange)
+        else -> Playability.Supported
+    }
+    PlannedVideoRoute.ClientTransformed -> Playability.Supported
+    PlannedVideoRoute.NativeDolbyVision, PlannedVideoRoute.Unspecified ->
+        if (isDirectPlayableDolbyVisionProfile(profile, nativeHdr)) {
+            Playability.Supported
+        } else {
+            Playability.UnsupportedDvProfile(profile)
+        }
+}
+
+/**
+ * Whether the active output carries the base range a Profile 8 base-layer
+ * plan promised. The range must be named: the renderer forces the stream
+ * through an ordinary HEVC decoder on this route and the colour repair keys
+ * off the promised range, so a plan that omitted it cannot be verified and
+ * must not be read as SDR.
+ */
+private fun baseRangeSupported(baseRange: String, nativeHdr: HdrCapabilities): Boolean =
+    when (baseRange.trim().lowercase()) {
+        "hdr10" -> nativeHdr.hdr10
+        "hlg" -> nativeHdr.hlg
+        "sdr" -> true
+        else -> false
+    }
+
+/** Derives the preflight route from the plan the client is executing. */
+fun plannedVideoRouteFor(
+    decisionReason: String?,
+    effectiveDynamicRange: String?,
+    clientTransformations: List<String>,
+): PlannedVideoRoute = when {
+    clientTransformations.isNotEmpty() -> PlannedVideoRoute.ClientTransformed
+    decisionReason == org.siloserver.silo.model.playback.DECISION_REASON_CLIENT_DV8_BASE_LAYER ->
+        PlannedVideoRoute.DolbyVisionProfile8BaseLayer(effectiveDynamicRange.orEmpty().lowercase())
+    effectiveDynamicRange.equals("dolby_vision", ignoreCase = true) -> PlannedVideoRoute.NativeDolbyVision
+    else -> PlannedVideoRoute.Unspecified
+}
 
 /**
  * Whether the connected sink will carry [codec] as an encoded stream at

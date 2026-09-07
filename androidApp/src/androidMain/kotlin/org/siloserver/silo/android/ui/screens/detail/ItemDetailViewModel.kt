@@ -34,7 +34,6 @@ import org.siloserver.silo.playback.subtitleTrackFingerprint
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.update
@@ -213,6 +212,7 @@ class ItemDetailViewModel(
         displayTitle: String,
         forceRedownloadMissingLocal: Boolean = false,
         downloadQuality: DownloadQuality? = null,
+        downloadContentId: String = contentId,
     ) {
         val existing = downloadRecordFor(version)
         when (
@@ -234,11 +234,11 @@ class ItemDetailViewModel(
             DetailDownloadTapAction.ReplaceAndStart -> viewModelScope.launch {
                 val staleRecord = existing
                 if (staleRecord == null || downloadsRepository.delete(staleRecord.id) is ApiResult.Success) {
-                    startDownload(version, displayTitle, downloadQuality)
+                    startDownload(version, displayTitle, downloadQuality, downloadContentId)
                 }
             }
             DetailDownloadTapAction.Start -> viewModelScope.launch {
-                startDownload(version, displayTitle, downloadQuality)
+                startDownload(version, displayTitle, downloadQuality, downloadContentId)
             }
         }
     }
@@ -251,67 +251,18 @@ class ItemDetailViewModel(
     private suspend fun startDownload(
         version: FileVersion,
         displayTitle: String,
-        downloadQuality: DownloadQuality? = null,
+        downloadQuality: DownloadQuality?,
+        downloadContentId: String,
     ) {
         // wifiOnly read from per-profile PlayerSettingsStore inside
         // DownloadEnqueuer.start; default true.
         val result = downloadEnqueuer.start(
-            contentId = contentId,
+            contentId = downloadContentId,
             fileId = version.fileId,
             displayTitle = displayTitle,
             downloadQualityOverride = downloadQuality,
         )
         _downloadStartEvents.emit(result is ApiResult.Success)
-    }
-
-    /**
-     * Per-episode download tap. Picks the best file for the episode (first
-     * entry in the server-sorted files list) and queues it. If the episode
-     * has no files (rare — orphaned record), no-ops.
-     */
-    fun onEpisodeDownloadTapped(
-        episode: EpisodeListItem,
-        downloadQuality: DownloadQuality? = null,
-    ) {
-        val fileId = episode.files.firstOrNull()?.fileId ?: return
-        val detail = _uiState.value.detail ?: return
-        // Branch on current state like the movie/audiobook path: a downloaded
-        // episode is a no-op (manage via the Downloads tab); an in-flight one
-        // cancels; otherwise start. Previously it always re-enqueued.
-        val existing = downloads.value.firstOrNull { it.mediaFileId == fileId }
-        when (detailDownloadTapAction(existing?.statusEnum(), forceRedownloadMissingLocal = false)) {
-            DetailDownloadTapAction.Ignore -> Unit
-            DetailDownloadTapAction.Cancel -> existing?.let { record ->
-                val cancelScope = downloadEnqueuer.captureCancelScope()
-                viewModelScope.launch {
-                    downloadEnqueuer.cancel(record.id, fileId, cancelScope)
-                    downloadsRepository.delete(record.id)
-                }
-            }
-            DetailDownloadTapAction.Start, DetailDownloadTapAction.ReplaceAndStart -> viewModelScope.launch {
-                // Episode pages load the episode itself as `detail`, so the
-                // parent reference supplies the series id/title for grouping.
-                downloadEnqueuer.startEpisode(
-                    seriesContentId = if (detail.type == "series") {
-                        detail.contentId
-                    } else {
-                        detail.seriesId ?: detail.contentId
-                    },
-                    episodeContentId = episode.contentId,
-                    fileId = fileId,
-                    seriesTitle = if (detail.type == "series") {
-                        detail.title
-                    } else {
-                        detail.seriesTitle ?: detail.title
-                    },
-                    seasonNumber = episode.seasonNumber,
-                    episodeNumber = episode.episodeNumber,
-                    episodeTitle = episode.title,
-                    posterUrl = detail.posterUrl,
-                    downloadQualityOverride = downloadQuality,
-                )
-            }
-        }
     }
 
     /** Series-level "Download series" — uses the server's batch endpoint
@@ -326,26 +277,21 @@ class ItemDetailViewModel(
         }
     }
 
-    /** Per-season "Download season" — server has no season-batch endpoint
-     *  so this loops POST-per-episode locally inside the enqueuer. */
-    fun onSeasonDownloadTapped(
-        seasonNumber: Int,
-        downloadQuality: DownloadQuality? = null,
-    ) {
-        val detail = _uiState.value.detail ?: return
-        viewModelScope.launch {
-            downloadEnqueuer.startSeason(
-                seriesContentId = detail.contentId,
-                seasonNumber = seasonNumber,
-                downloadQualityOverride = downloadQuality,
-            )
-        }
-    }
-
     init {
         if (contentId.isNotBlank()) {
             loadDetail()
             loadUserState()
+        }
+    }
+
+    suspend fun hasSeriesDetailForRedirect(seriesContentId: String): Boolean {
+        fun ItemDetail?.matchesParent(): Boolean =
+            this != null && contentId == seriesContentId && type.equals("series", ignoreCase = true)
+
+        if (catalogRepository.getCachedItemDetail(seriesContentId).matchesParent()) return true
+        return when (val result = catalogRepository.getItemDetail(seriesContentId)) {
+            is ApiResult.Success -> result.data.matchesParent()
+            else -> false
         }
     }
 
@@ -1108,7 +1054,6 @@ class ItemDetailViewModel(
             }
         }
     }
-
 
     /**
      * Fire (or auto-fire once, when [auto] is set) the description

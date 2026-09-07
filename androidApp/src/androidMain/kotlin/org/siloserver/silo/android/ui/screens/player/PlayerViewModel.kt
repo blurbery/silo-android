@@ -1,8 +1,9 @@
 package org.siloserver.silo.android.ui.screens.player
 
 import org.siloserver.silo.common.player.dolbyVisionTransformClassification
+import org.siloserver.silo.common.player.failedRendererTrackType
 import org.siloserver.silo.common.player.failureDiagnostics
-
+import org.siloserver.silo.common.player.failureClassification
 import android.os.SystemClock
 import android.util.Log
 import androidx.lifecycle.ViewModel
@@ -44,8 +45,7 @@ import org.siloserver.silo.common.player.video.VideoPlaybackSessionCoordinator
 import org.siloserver.silo.common.player.video.VideoPlaybackStartRequest
 import org.siloserver.silo.common.player.video.VideoPlayerRouteArgs
 import org.siloserver.silo.common.player.video.VideoPlayerUiState
-import org.siloserver.silo.common.player.video.canPlayResolvedStreamDirectly
-import org.siloserver.silo.common.player.video.resolvedPlaybackDelivery
+import org.siloserver.silo.common.player.video.serverTerminalUserMessage
 import org.siloserver.silo.common.settings.LetterboxExpansion
 import org.siloserver.silo.common.settings.PlayerSettingsStore
 import org.siloserver.silo.common.settings.dolbyVisionPolicySnapshot
@@ -61,8 +61,7 @@ import org.siloserver.silo.model.settings.SubtitleAppearance
 import org.siloserver.silo.model.playback.PlayMethod
 import org.siloserver.silo.model.playback.PlaybackDelivery
 import org.siloserver.silo.model.playback.PlaybackExecutionPlan
-import org.siloserver.silo.model.playback.PlaybackRouteFamily
-import org.siloserver.silo.model.playback.PlaybackSessionResponse
+import org.siloserver.silo.model.playback.executableMedia3ClientTransformations
 import org.siloserver.silo.model.playback.PlayerSubtitleInfo
 import org.siloserver.silo.model.playback.CommittedSubtitle
 import org.siloserver.silo.model.playback.SubtitleIdentity
@@ -72,10 +71,8 @@ import org.siloserver.silo.model.playback.mergeDownloadedSubtitles
 import org.siloserver.silo.model.playback.rebaseDownloadedSubtitleUrl
 import org.siloserver.silo.model.playback.resolvedSelectedSubtitleIndex
 import org.siloserver.silo.model.playback.resolvePlaybackStartPosition
-import org.siloserver.silo.model.playback.combinedSubtitleSelectionIndexes
 import org.siloserver.silo.playback.PlaybackSubtitleReady
 import org.siloserver.silo.playback.applyAuthoritativeSubtitleReadyTrack
-import org.siloserver.silo.model.catalog.SubtitleTrack
 import org.siloserver.silo.model.subtitles.SubtitleAiJob
 import org.siloserver.silo.model.subtitles.SubtitleAiQuota
 import org.siloserver.silo.model.subtitles.SubtitleAiStatus
@@ -510,6 +507,14 @@ class PlayerViewModel(
         },
         onSnapshotChanged = ::applyMobileSubtitleSnapshot,
         onCommittedPlayback = ::adoptMobileSubtitlePlayback,
+        onEmbeddedSubtitleFailure = { serverIndex ->
+            startProtocolV3Replan(
+                classification = "subtitle_embedded_failed",
+                notice = "Embedded subtitles couldn't load. Retrying with a sidecar.",
+                state = _uiState.value,
+                subtitleTrackIndexOverride = serverIndex,
+            )
+        },
         onCommittedPlaybackFailure = ::recoverFromSubtitleAdoptionFailure,
     )
 
@@ -633,11 +638,11 @@ class PlayerViewModel(
     private var transientNetworkRetries = 0
     private var recoveryJob: Job? = null
 
-    // Latest user track/quality/route change (classification to notice) that
+    // Latest user change or embedded-subtitle failure that
     // arrived while a recovery held the replan single-flight guard. Re-driven
     // once that flight completes so the selection isn't silently dropped;
     // last-write-wins because only the newest selection matters.
-    private var queuedInvalidationReplan: Pair<String, String>? = null
+    private var queuedInvalidationReplan: MobileRecoveryReplan? = null
 
     private enum class ServerSeekRecoveryMode {
         REANCHOR,
@@ -669,6 +674,18 @@ class PlayerViewModel(
     private var serverSeekRecoveryInFlight = false
     private var queuedServerSeek: ServerSeekRecoveryRequest? = null
     private var playbackRecoveryGeneration = 0L
+    // The service and this ViewModel survive screen recreation; applied evidence must too.
+    private val _mountedSubtitleMount = MutableStateFlow<MobileSubtitleMount?>(null)
+    internal val mountedSubtitleMount: StateFlow<MobileSubtitleMount?> = _mountedSubtitleMount
+
+    internal fun onSubtitleMediaMountChanging() {
+        _mountedSubtitleMount.value = null
+    }
+
+    internal fun onSubtitleMediaMountApplied(mount: MobileSubtitleMount) {
+        _mountedSubtitleMount.value = mount
+    }
+
     private var mediaMountSequence = 0L
     private var awaitingMediaMountGeneration: Long? = null
     private val subtitleRefreshGate = SubtitleRefreshGate()
@@ -1233,7 +1250,6 @@ class PlayerViewModel(
             mediaFileId = version?.fileId ?: playbackState.fileId,
             mountedSubtitles = playbackState.subtitleUrls,
             sessionId = playbackState.sessionId.orEmpty(),
-            serverUrl = playbackState.serverUrl,
             persistedPreference = localTrackSelection
                 ?.subtitleFingerprint
                 ?.takeUnless { explicitSubtitlePickResolved || isSessionRenewal },
@@ -1441,6 +1457,11 @@ class PlayerViewModel(
         val notice = when (reason) {
             is Playability.UnsupportedDvProfile ->
                 "This device cannot play Dolby Vision Profile ${reason.profile}. Falling back to transcoded stream."
+            is Playability.DvBaseLayerMetadataMismatch,
+            is Playability.DvBaseLayerOutputMismatch,
+            is Playability.DvBaseLayerDecoderUnavailable,
+            ->
+                "The Dolby Vision base-layer route could not be verified on this output. Requesting another route."
             is Playability.UnsupportedAudioCodec ->
                 "Lossless audio not supported on this output. Falling back to transcoded stream."
             is Playability.UnsupportedChannelCount ->
@@ -1493,7 +1514,15 @@ class PlayerViewModel(
      * Previously the mobile player had no error handling at all: a decoder or
      * IO failure left the screen on a stale frame/spinner forever.
      */
-    fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+    /**
+     * @param servicePlayer the in-process player the error came from, when the
+     * screen has it. The controller-side [error] has lost its renderer
+     * attribution; the service player still knows which renderer failed.
+     */
+    fun onPlayerError(
+        error: androidx.media3.common.PlaybackException,
+        servicePlayer: androidx.media3.common.Player? = null,
+    ) {
         val state = _uiState.value
         val message = error.localizedMessage?.takeIf { msg -> msg.isNotBlank() }
             ?: "Playback failed. Please try again."
@@ -1632,6 +1661,7 @@ class PlayerViewModel(
                     message,
                     state,
                     diagnostics = diagnostics,
+                    failedTrackType = error.failedRendererTrackType(servicePlayer),
                 )
             }
             return
@@ -1651,20 +1681,24 @@ class PlayerViewModel(
         notice: String,
         state: PlayerUiState,
         diagnostics: Map<String, String> = emptyMap(),
+        failedTrackType: Int? = null,
         audioTrackIndexOverride: Int? = null,
+        subtitleTrackIndexOverride: Int? = null,
     ) {
+        val queuedRequest = MobileRecoveryReplan(classification, notice, subtitleTrackIndexOverride)
         if (recoveryJob?.isActive == true || serverSeekRecoveryInFlight) {
             // Never silently drop a user selection: queue it (newest wins) and
             // re-drive it when the in-flight recovery completes. Failure-driven
-            // replans stay dropped — onPlayerError re-raises those.
-            if (classification in PlaybackSessionManager.USER_INVALIDATION_CLASSIFICATIONS) {
-                queuedInvalidationReplan = classification to notice
+            // replans stay dropped — onPlayerError re-raises those. Native
+            // subtitle failures have no player-error retry, so retain them.
+            if (queuedRequest.shouldQueue) {
+                queuedInvalidationReplan = queuedRequest
             }
             return
         }
         if (mobileSubtitleTransactions.hasActiveTransaction) {
             if (classification in PlaybackSessionManager.USER_INVALIDATION_CLASSIFICATIONS) {
-                queuedInvalidationReplan = classification to notice
+                queuedInvalidationReplan = queuedRequest
                 return
             }
             mobileSubtitleTransactions.invalidate()
@@ -1672,7 +1706,7 @@ class PlayerViewModel(
         val fileId = state.versions.getOrNull(state.selectedVersionIndex)?.fileId ?: return
         val recoveryGeneration = playbackRecoveryGeneration
         recoveryJob = viewModelScope.launch {
-            val selectedSubtitleTrackIndex = selectedServerSubtitleTrackIndex(
+            val selectedSubtitleTrackIndex = subtitleTrackIndexOverride ?: selectedServerSubtitleTrackIndex(
                 selectedOrdinal = state.selectedSubtitleIndex,
                 subtitleTracks = state.subtitleTracks,
             )
@@ -1682,6 +1716,17 @@ class PlayerViewModel(
                     audioTracks = state.versions.getOrNull(state.selectedVersionIndex)?.audioTracks.orEmpty(),
                 )
             val dolbyVision = playerSettingsStore.dolbyVisionPolicySnapshot()
+            // A local Dolby Vision recipe that failed on this hardware is
+            // withdrawn before the replan context is built, so the server
+            // plans from what this device can still execute rather than
+            // handing back the route that just failed.
+            capabilityDetector.transformQuarantine.noteFailure(
+                classification = classification,
+                activeTransformations = state.playbackPlan
+                    ?.executableMedia3ClientTransformations()
+                    .orEmpty(),
+                failedTrackType = failedTrackType,
+            )
             val capabilities = capabilityDetector.detect(dolbyVision = dolbyVision)
             val playbackContext = capabilityDetector.detectPlaybackContext(
                 formFactor = "mobile",
@@ -1720,6 +1765,11 @@ class PlayerViewModel(
             }
             currentCoroutineContext().ensureActive()
             if (recoveryGeneration != playbackRecoveryGeneration) return@launch
+            if (queuedRequest.isNonfatalFailure(result)) {
+                showVersionSwitchMessage("Subtitles couldn't load — playback continues.")
+                _uiState.update { it.copy(isLoading = false, isBuffering = false) }
+                return@launch
+            }
             when (result) {
                 is ApiResult.Success -> when (val decision = result.data) {
                     is VideoSessionStartV3.Ready -> {
@@ -1870,8 +1920,7 @@ class PlayerViewModel(
                     }
                     is VideoSessionStartV3.Terminal -> {
                         val failedSessionId = state.sessionId ?: return@launch
-                        val terminalMessage =
-                            "Playback unavailable (${decision.reason}): ${decision.message}"
+                        val terminalMessage = serverTerminalUserMessage(decision.message)
                         val terminalStillCurrent = sessionLifecycle.stopTerminalSessionIfCurrent(
                             expectedSessionId = failedSessionId,
                             isCurrent = {
@@ -1920,11 +1969,16 @@ class PlayerViewModel(
     }
 
     private fun redriveQueuedInvalidationReplan() {
-        val (classification, notice) = queuedInvalidationReplan ?: return
+        val queued = queuedInvalidationReplan ?: return
         queuedInvalidationReplan = null
         // Current state, not the queuing-time state, so the replan carries the
         // latest committed track/quality selection.
-        startProtocolV3Replan(classification, notice, _uiState.value)
+        startProtocolV3Replan(
+            queued.classification,
+            queued.notice,
+            _uiState.value,
+            subtitleTrackIndexOverride = queued.subtitleTrackIndexOverride,
+        )
     }
 
     /**
@@ -1947,14 +2001,6 @@ class PlayerViewModel(
                 )
             }
         }
-    }
-
-    private fun Playability.failureClassification(): String = when (this) {
-        is Playability.UnsupportedDvProfile -> "unsupported_dolby_vision_profile"
-        is Playability.UnsupportedAudioCodec -> "unsupported_audio_encoding"
-        is Playability.UnsupportedChannelCount -> "unsupported_audio_layout"
-        is Playability.StartupStalled -> classification
-        Playability.Supported -> "none"
     }
 
     private fun androidx.media3.common.PlaybackException.failureClassification(): String =
@@ -2004,6 +2050,7 @@ class PlayerViewModel(
         queuedServerSeek = null
         awaitingMediaMountGeneration = null
         positionReportsBlockedForPendingLoad = true
+        onSubtitleMediaMountChanging()
         seekRecoveryRollbackInvalidated = false
         clearBufferedSeekCommands()
         pendingNativeSeekAfterMount = null
@@ -3136,12 +3183,22 @@ class PlayerViewModel(
         mobileSubtitleTransactions.select(identity)
     }
 
-    fun onPendingSubtitleMountResult(
+    internal fun isCurrentSubtitleMount(mount: MobileSubtitleMount?): Boolean =
+        mount == _mountedSubtitleMount.value && isCurrentMobileSubtitleMount(
+            applied = mount,
+            expected = MobileSubtitleMount(_uiState.value.mediaMountGeneration, _uiState.value.subtitleRefreshNonce),
+            awaitingGeneration = awaitingMediaMountGeneration,
+            loading = positionReportsBlockedForPendingLoad,
+        )
+
+    internal fun onPendingSubtitleMountResult(
+        mount: MobileSubtitleMount?,
         identity: SubtitleIdentity,
         selected: Boolean,
         snapshotKey: String?,
         settled: Boolean,
     ) {
+        if (!isCurrentSubtitleMount(mount)) return
         mobileSubtitleTransactions.reportMountedSelection(
             identity = identity,
             selected = selected,
@@ -3577,7 +3634,6 @@ class PlayerViewModel(
             existing = current.subtitleTracks,
             downloaded = downloaded,
             sessionId = sessionId,
-            serverUrl = current.serverUrl,
         )
         val autoIndex = autoSelectSubtitleId?.let { id -> downloadedTrackIndex(merged, downloaded, id) }
         _uiState.update {
@@ -4198,12 +4254,6 @@ class PlayerViewModel(
         }
     }
 
-    /** Show controls and reset the auto-hide timer. */
-    fun onShowControls() {
-        _uiState.update { it.copy(showControls = true) }
-        scheduleControlsHide()
-    }
-
     /** Called when the user exits the player. */
     fun onExit() {
         if (!exitPrepared.compareAndSet(false, true)) return
@@ -4311,7 +4361,6 @@ class PlayerViewModel(
         )
         return watchDetail.versions.indexOfFirst { it.fileId == selected.fileId }.takeIf { it >= 0 } ?: 0
     }
-
 
     /**
      * Offline-first playback path. Returns true (and populates UiState with a

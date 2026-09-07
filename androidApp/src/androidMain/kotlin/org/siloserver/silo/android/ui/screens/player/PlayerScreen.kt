@@ -38,6 +38,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -70,6 +71,8 @@ import org.siloserver.silo.common.player.ActivePlayerHolder
 import org.siloserver.silo.common.player.AudioCapabilityManager
 import org.siloserver.silo.common.player.SiloPlaybackService
 import org.siloserver.silo.common.player.DisplayHdrProbe
+import org.siloserver.silo.common.player.playbackDisplayId
+import org.siloserver.silo.common.player.plannedVideoRouteFor
 import org.siloserver.silo.common.player.PlaybackCapabilityDetector
 import org.siloserver.silo.common.player.PlaybackPreflightListener
 import org.siloserver.silo.common.player.RefreshRateMatcher
@@ -83,21 +86,19 @@ import org.siloserver.silo.common.pip.SiloPictureInPicturePlaybackState
 import org.siloserver.silo.common.pip.SiloPictureInPictureSurface
 import org.siloserver.silo.common.settings.LetterboxExpansion
 import org.siloserver.silo.common.player.backend.VideoPlaybackBackendFactory
-import org.siloserver.silo.common.player.backend.VideoPlaybackBackendRequest
 import org.siloserver.silo.common.player.video.mountedAudioTracks
 import org.siloserver.silo.common.player.video.selectedMountedAudioOrdinal
 import org.siloserver.silo.common.player.video.PlaybackStartupStallDetector
 import org.siloserver.silo.common.player.video.PlaybackRuntimeCorrectionMetrics
 import org.siloserver.silo.common.player.video.PostResumeVideoStallDetector
+import org.siloserver.silo.common.player.isSubtitleSelected
 import org.siloserver.silo.common.player.video.VideoPlayerTrackEntry
-import org.siloserver.silo.model.playback.PlayMethod
-import org.siloserver.silo.model.playback.PlaybackSourceMetadata
 import org.siloserver.silo.model.playback.PlaybackExecutionPlan
 import org.siloserver.silo.model.playback.PlayerSubtitleInfo
 import org.siloserver.silo.model.playback.SubtitleIdentity
 import org.siloserver.silo.model.playback.executableMedia3ClientTransformations
+import org.siloserver.silo.model.playback.activeOriginalHttpClaims
 import org.siloserver.silo.model.watchtogether.RoomSnapshot
-import org.siloserver.silo.player.DolbyVisionDetection
 import com.google.common.util.concurrent.MoreExecutors
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -217,7 +218,27 @@ fun PlayerScreen(
     val audioCapabilityManager: AudioCapabilityManager = koinInject()
     val capabilityDetector: PlaybackCapabilityDetector = koinInject()
     val subtitleManager: SubtitleManager = koinInject()
-    val displayHdr = remember { DisplayHdrProbe.probe(context) }
+    // Bind the playback display before anything plans: the ViewModel's
+    // initializer starts loading as soon as it exists, so the binding has to
+    // happen during composition, not in a later effect.
+    // The binding is owned: during a player-to-player transition the incoming
+    // screen binds while the outgoing one is still composed, and the outgoing
+    // screen's release only clears its own claim.
+    // Keyed on the display id itself so an Activity that moves to another
+    // display rebinds and the next plan describes the new panel. The
+    // binding is a RememberObserver: Compose releases it when this player
+    // leaves, when the key changes, and when a composition is abandoned
+    // before it commits, and the owned release never clears a newer claim.
+    val currentPlaybackDisplayId = context.playbackDisplayId()
+    remember(currentPlaybackDisplayId, capabilityDetector) {
+        capabilityDetector.bindPlaybackDisplay(currentPlaybackDisplayId)
+    }
+    // Re-probe whenever the output route generation moves, so track
+    // selection sees the same display facts as capability detection.
+    val outputRouteGeneration by audioCapabilityManager.outputRouteGeneration.collectAsState()
+    val displayHdr = remember(outputRouteGeneration) {
+        DisplayHdrProbe.probe(context, capabilityDetector.playbackDisplayId)
+    }
     val refreshRateMatcher = remember { RefreshRateMatcher() }
     val audioCaps by audioCapabilityManager.capabilities.collectAsState()
     var exitRequested by remember { mutableStateOf(false) }
@@ -397,14 +418,13 @@ fun PlayerScreen(
         backendPlayer?.let { player ->
             backendFactory.create(
                 player = player,
-                request = VideoPlaybackBackendRequest(),
             )
         }
     }
     // A neutral-v3 replan publishes replacement route state before the
     // corresponding Compose mount effect runs. Subtitle restoration must wait
     // for that exact media generation rather than racing a newly mounted route.
-    var mountedMediaGeneration by remember(videoBackend) { mutableStateOf<Long?>(null) }
+    val mountedSubtitleMount by viewModel.mountedSubtitleMount.collectAsState()
     // False until presets have been applied once for the current backend, so
     // only later capability changes wait for the route to settle.
     var trackPresetsApplied by remember(videoBackend) { mutableStateOf(false) }
@@ -725,6 +745,7 @@ fun PlayerScreen(
             expectedColorRange = plan.validatedColorRangeFallback(),
             transformations = plan?.executableMedia3ClientTransformations().orEmpty(),
             runtimeCorrections = plan?.runtimeCorrections.orEmpty(),
+            activeClaims = plan?.activeOriginalHttpClaims().orEmpty(),
         )
         if (!isLocalMedia && uiState.sessionId != null) {
             PlaybackRuntimeCorrectionMetrics.reset()
@@ -742,8 +763,9 @@ fun PlayerScreen(
                     "${plan?.decisionTrace?.size ?: 0}:${uiState.mediaMountGeneration}",
             )
         }
+        viewModel.onSubtitleMediaMountChanging()
         backend.mount(mediaSpec, playWhenReady = !viewModel.uiState.value.isPaused)
-        mountedMediaGeneration = uiState.mediaMountGeneration
+        viewModel.onSubtitleMediaMountApplied(MobileSubtitleMount(uiState.mediaMountGeneration, uiState.subtitleRefreshNonce))
         viewModel.onMediaMountApplied(uiState.mediaMountGeneration)
     }
 
@@ -806,8 +828,11 @@ fun PlayerScreen(
             expectedColorRange = plan.validatedColorRangeFallback(),
             transformations = plan?.executableMedia3ClientTransformations().orEmpty(),
             runtimeCorrections = plan?.runtimeCorrections.orEmpty(),
+            activeClaims = plan?.activeOriginalHttpClaims().orEmpty(),
         )
+        viewModel.onSubtitleMediaMountChanging()
         backend.refresh(mediaSpec)
+        viewModel.onSubtitleMediaMountApplied(MobileSubtitleMount(uiState.mediaMountGeneration, uiState.subtitleRefreshNonce))
     }
 
     // Sync play/pause from ViewModel to player without reclassifying this
@@ -825,6 +850,9 @@ fun PlayerScreen(
     // Preflight listener: evaluates the resolved Tracks and triggers the
     // transcode fallback when the selected track combo can't actually be
     // played on this device.
+    // The preflight listener is keyed on the controller and outlives engine
+    // swaps; read the service player at error time, not at registration.
+    val latestServicePlayerForErrors = rememberUpdatedState(sessionPlayer)
     DisposableEffect(mediaController) {
         val controller = mediaController
         if (controller == null) {
@@ -837,7 +865,15 @@ fun PlayerScreen(
                 // same recovery ladder as preflight failures — previously the
                 // mobile player dropped these on the floor and the screen sat
                 // on a stale frame.
-                onError = { error -> viewModel.onPlayerError(error) },
+                onError = { error -> viewModel.onPlayerError(error, servicePlayer = latestServicePlayerForErrors.value) },
+                plannedRoute = {
+                    val plan = viewModel.uiState.value.playbackPlan
+                    plannedVideoRouteFor(
+                        decisionReason = plan?.decisionTrace?.firstOrNull(),
+                        effectiveDynamicRange = plan?.source?.hdrFormat,
+                        clientTransformations = plan?.executableMedia3ClientTransformations().orEmpty(),
+                    )
+                },
             )
             controller.addListener(preflight)
             onDispose { controller.removeListener(preflight) }
@@ -958,18 +994,22 @@ fun PlayerScreen(
                     // already fired (against the OLD tracks), so without this the
                     // auto-selected downloaded/AI track never engages. Reads the
                     // live VM state — `uiState` here can be a stale closure capture.
+                    val mount = viewModel.mountedSubtitleMount.value
+                    val backend = videoBackend ?: return
+                    if (!viewModel.isCurrentSubtitleMount(mount)) return
+                    val currentTracks = backend.player.currentTracks
                     val liveState = viewModel.uiState.value
                     val pendingIdentity = liveState.localSubtitleMountIdentity
                     val targetIdentity = pendingIdentity ?: liveState.committedSubtitleIdentity
-                    val selected = videoBackend?.selectMountedSubtitle(
-                        identity = targetIdentity,
-                    ) == true
+                    val accepted = backend.selectMountedSubtitle(identity = targetIdentity)
+                    val selected = isSubtitleSelected(currentTracks, targetIdentity)
                     if (pendingIdentity != null) {
                         viewModel.onPendingSubtitleMountResult(
+                            mount = mount,
                             identity = pendingIdentity,
                             selected = selected,
-                            snapshotKey = media3TextTrackSnapshotKey(tracks),
-                            settled = videoBackend?.player?.playbackState == Player.STATE_READY,
+                            snapshotKey = media3TextTrackSnapshotKey(currentTracks),
+                            settled = backend.player.playbackState == Player.STATE_READY && (selected || !accepted),
                         )
                     }
                 }
@@ -1095,6 +1135,24 @@ fun PlayerScreen(
         }
     }
 
+    // A plan that promised the Dolby Vision Profile 8 base-layer route is
+    // only valid while an ordinary HEVC decoder is reading the stream. The
+    // renderer reports the decoder it actually opened; anything else becomes
+    // a typed replan rather than an unverified presentation.
+    LaunchedEffect(videoBackend) {
+        val backend = videoBackend ?: return@LaunchedEffect
+        backend.baseLayerDecoderMismatch.collect { decoderName ->
+            if (decoderName == null) return@collect
+            val plan = viewModel.uiState.value.playbackPlan
+            viewModel.onUnsupportedPlayback(
+                org.siloserver.silo.common.player.Playability.DvBaseLayerDecoderUnavailable(
+                    decoderName = decoderName,
+                    baseRange = plan?.source?.hdrFormat.orEmpty(),
+                ),
+            )
+        }
+    }
+
     // User/app seeks are explicit commands from the ViewModel. Progress
     // samples update uiState.position for display only and must never feed
     // back into MediaController.seekTo.
@@ -1122,10 +1180,11 @@ fun PlayerScreen(
         uiState.committedSubtitleIdentity,
         uiState.localSubtitleMountIdentity,
         uiState.mediaMountGeneration,
-        mountedMediaGeneration,
+        mountedSubtitleMount,
     ) {
         val backend = videoBackend ?: return@LaunchedEffect
-        if (mountedMediaGeneration != uiState.mediaMountGeneration) return@LaunchedEffect
+        val mount = mountedSubtitleMount
+        if (!viewModel.isCurrentSubtitleMount(mount)) return@LaunchedEffect
         val pendingIdentity = uiState.localSubtitleMountIdentity
         val targetIdentity = pendingIdentity ?: uiState.committedSubtitleIdentity
         val selectedIndex = resolveMobileSubtitleOrdinal(targetIdentity, uiState.subtitleTracks)
@@ -1136,11 +1195,12 @@ fun PlayerScreen(
             // an empty sidecar entry or refresh the mounted MediaItem.
             backend.selectMountedSubtitle(identity = SubtitleIdentity.Off)
         } else if (targetIdentity.requiresMountedMobileSelection()) {
-            val selected = backend.selectMountedSubtitle(identity = targetIdentity)
+            backend.selectMountedSubtitle(identity = targetIdentity)
             if (pendingIdentity != null) {
                 viewModel.onPendingSubtitleMountResult(
+                    mount = mount,
                     identity = pendingIdentity,
-                    selected = selected,
+                    selected = isSubtitleSelected(backend.player.currentTracks, targetIdentity),
                     snapshotKey = media3TextTrackSnapshotKey(backend.player.currentTracks),
                     // This composition-side attempt can race Media3's first
                     // text-track publication. Only onTracksChanged callbacks
@@ -1559,7 +1619,6 @@ private fun produceRoomClosedState(
     val soloClosedReason = remember { MutableStateFlow<String?>(null) }
     return (controller?.closedReason ?: soloClosedReason).collectAsState()
 }
-
 
 private fun PlaybackExecutionPlan?.validatedPassthroughCodecs(): List<String> {
     val plan = this ?: return emptyList()

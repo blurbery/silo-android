@@ -68,6 +68,7 @@ import org.siloserver.silo.tv.ui.screens.cast.TvSiloCastStandbyView
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import org.koin.compose.koinInject
+import org.siloserver.silo.common.player.playbackDisplayId
 import org.koin.compose.viewmodel.koinViewModel
 import org.koin.core.qualifier.named
 
@@ -1167,6 +1168,21 @@ fun TvAppNavigation(
                     nonce = episodeSelectionHandoffNonce,
                     targetContentId = contentId,
                 )
+            }
+            // TvPlayerViewModel starts loading in its initializer, which runs
+            // while TvPlayerScreen's default parameters are evaluated. Bind
+            // the playback display first so the very first capability probe
+            // describes the panel that will show the video.
+            val playerContext = androidx.compose.ui.platform.LocalContext.current
+            val capabilityDetector = koinInject<org.siloserver.silo.common.player.PlaybackCapabilityDetector>()
+            // This early binding is superseded when TvPlayerScreen binds its
+            // own during composition. The binding is a RememberObserver, so
+            // Compose releases it on ordinary disposal and on an abandoned
+            // composition alike; the owned release is a no-op once the
+            // screen's binding has taken over.
+            val earlyPlaybackDisplayId = playerContext.playbackDisplayId()
+            remember(earlyPlaybackDisplayId, capabilityDetector) {
+                capabilityDetector.bindPlaybackDisplay(earlyPlaybackDisplayId)
             }
             TvPlayerScreen(
                 contentId = contentId,

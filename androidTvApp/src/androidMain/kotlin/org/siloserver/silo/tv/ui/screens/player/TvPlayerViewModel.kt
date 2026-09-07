@@ -3,10 +3,10 @@
 package org.siloserver.silo.tv.ui.screens.player
 
 import org.siloserver.silo.common.player.dolbyVisionTransformClassification
+import org.siloserver.silo.common.player.failedRendererTrackType
 import org.siloserver.silo.common.player.failureDiagnostics
-
+import org.siloserver.silo.common.player.failureClassification
 import org.siloserver.silo.tv.BuildConfig
-
 import android.os.SystemClock
 import android.util.Log
 import org.siloserver.silo.common.player.SubDiag
@@ -65,7 +65,7 @@ import org.siloserver.silo.common.player.video.captureEpisodeSubtitleIntent
 import org.siloserver.silo.common.player.video.resolveAudioSelectionAcrossVersions
 import org.siloserver.silo.common.player.normalizedSubtitleCodecFamily
 import org.siloserver.silo.common.player.video.VideoPlayerUiState
-import org.siloserver.silo.common.player.video.resolvedPlaybackDelivery
+import org.siloserver.silo.common.player.video.serverTerminalUserMessage
 import org.siloserver.silo.common.settings.PlayerSettingsStore
 import org.siloserver.silo.common.settings.dolbyVisionPolicySnapshot
 import org.siloserver.silo.domain.player.IntroAutoSkipController
@@ -78,6 +78,7 @@ import org.siloserver.silo.model.catalog.TimeRange
 import org.siloserver.silo.model.catalog.VersionChapter
 import org.siloserver.silo.model.settings.SubtitleAppearance
 import org.siloserver.silo.model.playback.AutoSubtitleCandidate
+import org.siloserver.silo.model.playback.executableMedia3ClientTransformations
 import org.siloserver.silo.model.playback.AutoSubtitleContext
 import org.siloserver.silo.model.playback.AutoSubtitleResolution
 import org.siloserver.silo.model.playback.inventoryAutoSubtitleCandidates
@@ -89,13 +90,11 @@ import org.siloserver.silo.model.playback.PlayMethod
 import org.siloserver.silo.model.playback.ClientCodecCapabilities
 import org.siloserver.silo.model.playback.ClientPlaybackContext
 import org.siloserver.silo.model.playback.PlaybackExecutionPlan
-import org.siloserver.silo.model.playback.PlaybackRouteFamily
 import org.siloserver.silo.model.playback.PlaybackSessionResponse
 import org.siloserver.silo.model.playback.PlaybackTimeline
 import org.siloserver.silo.model.playback.PlayerSubtitleInfo
 import org.siloserver.silo.model.playback.SubtitleIdentity
 import org.siloserver.silo.model.playback.SubtitleMediaIdentity
-import org.siloserver.silo.model.playback.buildPlaybackSubtitleChoices
 import org.siloserver.silo.model.playback.enrichAuthoritativePlaybackSubtitleChoices
 import org.siloserver.silo.model.playback.resolvedSelectedSubtitleIndex
 import org.siloserver.silo.model.playback.mergeDownloadedSubtitles
@@ -110,10 +109,8 @@ import org.siloserver.silo.model.subtitles.SubtitleTranslateRequest
 import org.siloserver.silo.network.ApiResult
 import org.siloserver.silo.network.errorMessage
 import org.siloserver.silo.playback.nextEpisodeAfter
-import org.siloserver.silo.playback.subtitleTrackFingerprint
 import org.siloserver.silo.playback.canonicalSubtitleLanguage
 import org.siloserver.silo.playback.subtitleLabelIndicatesHearingImpaired
-import org.siloserver.silo.player.DolbyVisionPolicy
 import org.siloserver.silo.repository.SubtitlesRepository
 import org.siloserver.silo.repository.port.PlaybackWriteScope
 import org.siloserver.silo.repository.port.TrackSelectionFingerprintUpdate
@@ -183,7 +180,7 @@ internal fun authoritativePlaybackQualityOptions(
 ): List<VideoQualityOption> = available.map { quality ->
     VideoQualityOption(
         id = quality.label,
-        label = quality.label,
+        label = quality.displayName?.takeIf { it.isNotBlank() } ?: quality.label,
         isSelected = quality.label == selectedLabel,
         resolution = quality.height.takeIf { it > 0 }?.let { "${it}p" },
     )
@@ -1054,13 +1051,11 @@ class TvPlayerViewModel(
         // the screen renders the Popups above the open HUD.
         val showSubtitleSearchDialog: Boolean = false,
         val showAiTranslateDialog: Boolean = false,
-        val showSubtitleStyleDialog: Boolean = false,
         // Overlay visibility (Phase E — driven by the screen but stored here
         // so the overlay can react to play/pause state changes).
         val showControls: Boolean = true,
         val controlsVisibilityNonce: Int = 0,
         val hudOpen: Boolean = false,
-        val showSubtitleMenu: Boolean = false,
         val preferredAudioLanguage: String? = null,
         val preferredTextLanguage: String? = null,
         val preferredSubtitleMode: String? = null,
@@ -1131,6 +1126,7 @@ class TvPlayerViewModel(
         )
     private var subtitleMountGeneration = 0L
     private var lastAdapterMountIdentity: SubtitleIdentity? = null
+    private var lastAdapterMountGeneration: Long? = null
 
     /**
      * Authority for the NEXT mount the adapter arms, consumed by the snapshot
@@ -1193,6 +1189,7 @@ class TvPlayerViewModel(
             val localMountIdentity = snapshot.localMountIdentity
             if (localMountIdentity != null && localMountIdentity != lastAdapterMountIdentity) {
                 subtitleMountGeneration += 1
+                lastAdapterMountGeneration = subtitleMountGeneration
                 subtitleRemountReselection.arm(
                     identity = localMountIdentity,
                     generation = subtitleMountGeneration,
@@ -1207,6 +1204,12 @@ class TvPlayerViewModel(
                     .takeIf(List<PlayerTrackEntry>::isNotEmpty)
                     ?.let(::resolveSubtitleRemountReselection)
             } else if (localMountIdentity == null) {
+                lastAdapterMountGeneration?.let { generation ->
+                    if (subtitleRemountReselection.cancelOwned(generation)) {
+                        subtitleSnapshotSettlement.reset()
+                    }
+                }
+                lastAdapterMountGeneration = null
                 lastAdapterMountIdentity = null
             }
             if (autoSubtitleSelectionInFlight &&
@@ -1250,16 +1253,20 @@ class TvPlayerViewModel(
         onCommittedPlayback = ::adoptSubtitlePlayback,
         onCommittedPlaybackConfirmed = ::confirmSubtitlePlaybackPublication,
         onCommittedPlaybackRollback = ::rollbackSubtitlePlaybackPublication,
+        onEmbeddedSubtitleFailure = { serverIndex ->
+            startProtocolV3Replan(
+                classification = "subtitle_embedded_failed",
+                notice = "Embedded subtitles couldn't load. Retrying with a sidecar.",
+                state = _uiState.value,
+                subtitleTrackIndexOverride = serverIndex,
+            )
+        },
         onCommittedPlaybackFailure = { message ->
             _uiState.update { it.copy(error = message) }
         },
         hasMountableTracks = { _uiState.value.subtitleTracks.isNotEmpty() },
         isLocallyMountable = { identity ->
-            // Row-aware on purpose: a v3 inventory row describing a track muxed
-            // into a direct-play stream is still typed `delivery = sidecar`, so
-            // asking the identity resolver alone answered "not mounted" for the
-            // track Media3 already had, and every app-derived pick of it took
-            // the staged-replan path (see tvResolveMountedSubtitleTrack).
+            // Server-native and sidecar decisions require exact mounted IDs.
             val state = _uiState.value
             tvResolveMountedSubtitleTrack(
                 identity = identity,
@@ -1361,8 +1368,6 @@ class TvPlayerViewModel(
     val pendingRemoteSubtitleIndex: StateFlow<Int?> = _pendingRemoteSubtitleIndex.asStateFlow()
     // compareAndSet so a command arriving during the suspending apply isn't
     // clobbered by the clear of the one we just handled.
-    fun clearPendingRemoteAudio(applied: Int) { _pendingRemoteAudioIndex.compareAndSet(applied, null) }
-    fun clearPendingRemoteSubtitle(applied: Int) { _pendingRemoteSubtitleIndex.compareAndSet(applied, null) }
 
     // ---- Player settings flows (per-profile, DataStore-backed) -----------------
     val playbackSpeed: StateFlow<Double> = playerSettingsStore.playbackSpeedFlow
@@ -1779,6 +1784,10 @@ class TvPlayerViewModel(
      */
     fun onTransportMountApplied(nonce: Long) {
         if (transportMountGate.applied(nonce)) {
+            // A matching mount has replaced the item. Discard its predecessor's
+            // groups; only the new item's onTracksChanged can resolve subtitles.
+            _uiState.update { it.copy(subtitleTracks = emptyList()) }
+            subtitleSnapshotSettlement.reset()
             // The mounted item was replaced. Facts from the previous
             // transport's window must not be mapped through the new plan's
             // timeline offset — that can overstate the new extent and turn a
@@ -2339,6 +2348,11 @@ class TvPlayerViewModel(
         val notice = when (reason) {
             is org.siloserver.silo.common.player.Playability.UnsupportedDvProfile ->
                 "This device cannot play Dolby Vision Profile ${reason.profile}. Falling back to transcoded stream."
+            is org.siloserver.silo.common.player.Playability.DvBaseLayerMetadataMismatch,
+            is org.siloserver.silo.common.player.Playability.DvBaseLayerOutputMismatch,
+            is org.siloserver.silo.common.player.Playability.DvBaseLayerDecoderUnavailable,
+            ->
+                "The Dolby Vision base-layer route could not be verified on this output. Requesting another route."
             is org.siloserver.silo.common.player.Playability.UnsupportedAudioCodec ->
                 "Lossless audio not supported on this output. Falling back to transcoded stream."
             is org.siloserver.silo.common.player.Playability.UnsupportedChannelCount ->
@@ -2390,13 +2404,17 @@ class TvPlayerViewModel(
         state: UiState,
         qualityPreference: String? = null,
         diagnostics: Map<String, String> = emptyMap(),
+        failedTrackType: Int? = null,
         subtitleTrackIndexOverride: Int? = null,
     ) {
         if (recoveryJob?.isActive == true) {
             // Never silently drop a user selection: queue it (newest wins) and
             // re-drive it when the in-flight recovery completes. Failure-driven
-            // replans stay dropped — onPlayerError re-raises those.
-            if (classification in PlaybackSessionManager.USER_INVALIDATION_CLASSIFICATIONS) {
+            // replans stay dropped — onPlayerError re-raises those. Embedded
+            // mount failures have no player-error retry, so retain those too.
+            if (classification in PlaybackSessionManager.USER_INVALIDATION_CLASSIFICATIONS ||
+                classification == "subtitle_embedded_failed"
+            ) {
                 queuedRecoveryReplan = QueuedRecoveryReplan(
                     classification = classification,
                     notice = notice,
@@ -2421,6 +2439,17 @@ class TvPlayerViewModel(
             val dolbyVision = playerSettingsStore.dolbyVisionPolicySnapshot()
             coroutineContext.ensureActive()
             if (recoveryContentGeneration != contentLoadGeneration) return@launch
+            // A local Dolby Vision recipe that failed on this hardware is
+            // withdrawn before the replan context is built, so the server
+            // plans from what this device can still execute rather than
+            // handing back the route that just failed.
+            capabilityDetector.transformQuarantine.noteFailure(
+                classification = classification,
+                activeTransformations = state.playbackPlan
+                    ?.executableMedia3ClientTransformations()
+                    .orEmpty(),
+                failedTrackType = failedTrackType,
+            )
             val capabilities = capabilityDetector.detect(dolbyVision = dolbyVision)
             val playbackContext = capabilityDetector.detectPlaybackContext(
                 formFactor = "tv",
@@ -2582,9 +2611,12 @@ class TvPlayerViewModel(
                         )
                     }
                     is VideoSessionStartV3.Terminal -> {
+                        if (classification == "subtitle_embedded_failed") {
+                            onReplanRequestFailed(classification, notice, decision.message)
+                            return@launch
+                        }
                         val failedSessionId = state.sessionId ?: return@launch
-                        val terminalMessage =
-                            "Playback unavailable (${decision.reason}): ${decision.message}"
+                        val terminalMessage = serverTerminalUserMessage(decision.message)
                         cancelPendingCatalogSubtitle()
                         val terminalStillCurrent = sessionLifecycle.stopTerminalSessionIfCurrent(
                             expectedSessionId = failedSessionId,
@@ -2614,6 +2646,10 @@ class TvPlayerViewModel(
                     }
                     VideoSessionStartV3.ServerUpgradeRequired -> {
                         cancelPendingCatalogSubtitle()
+                        if (classification == "subtitle_embedded_failed") {
+                            onReplanRequestFailed(classification, notice, "Server upgrade required")
+                            return@launch
+                        }
                         _uiState.update {
                             it.copy(
                                 error = "This Silo server must be updated to support playback recovery.",
@@ -2662,7 +2698,9 @@ class TvPlayerViewModel(
      * tear playback down with a fatal error banner.
      */
     private fun onReplanRequestFailed(classification: String, notice: String, detail: String?) {
-        if (classification in PlaybackSessionManager.USER_INVALIDATION_CLASSIFICATIONS) {
+        if (classification in PlaybackSessionManager.USER_INVALIDATION_CLASSIFICATIONS ||
+            classification == "subtitle_embedded_failed"
+        ) {
             Log.w(TAG, "Invalidation replan failed ($classification): $detail")
             _uiState.update { it.copy(isLoading = false, isBuffering = false) }
         } else {
@@ -2674,14 +2712,6 @@ class TvPlayerViewModel(
                 )
             }
         }
-    }
-
-    private fun org.siloserver.silo.common.player.Playability.failureClassification(): String = when (this) {
-        is org.siloserver.silo.common.player.Playability.UnsupportedDvProfile -> "unsupported_dolby_vision_profile"
-        is org.siloserver.silo.common.player.Playability.UnsupportedAudioCodec -> "unsupported_audio_encoding"
-        is org.siloserver.silo.common.player.Playability.UnsupportedChannelCount -> "unsupported_audio_layout"
-        is org.siloserver.silo.common.player.Playability.StartupStalled -> classification
-        org.siloserver.silo.common.player.Playability.Supported -> "none"
     }
 
     private fun androidx.media3.common.PlaybackException.failureClassification(): String =
@@ -3695,16 +3725,6 @@ class TvPlayerViewModel(
         _uiState.update { it.copy(isBuffering = false, error = message) }
     }
 
-    private inline fun updateSeekRecoveryIfCurrent(
-        request: TvSeekRecoveryRequest,
-        transform: (UiState) -> UiState,
-    ) {
-        if (!isCurrentSeekRecovery(request)) return
-        _uiState.update { state ->
-            if (isCurrentSeekRecovery(request)) transform(state) else state
-        }
-    }
-
     // ---- Remote-control adapters (TvPlaybackRealtimeController calls these) ----
     /** True while in a Watch Together room — remote transport is gated (the room is authoritative). */
     val remoteTransportSuppressed: Boolean get() = roomId != null
@@ -4369,15 +4389,16 @@ class TvPlayerViewModel(
         }
     }
 
+    internal fun canApplySubtitleMount(request: TvSubtitleMountRequest): Boolean =
+        !transportMountGate.suppressPositionReports &&
+            subtitleRemountReselection.ownsResolved(request.owner.generation)
+
     internal fun onSubtitleSelectionApplied(request: TvSubtitleMountRequest) {
-        val owner = request.owner
-        subtitleRemountReselection.acknowledgeResolved(owner.generation)
-        subtitleTransactions.reportMountedSelection(
-            identity = owner.identity,
-            selected = true,
-            snapshotKey = "tv-mounted:${owner.generation}:${request.trackIndex}",
-            settled = true,
-        )
+        if (!subtitleRemountReselection.ownsResolved(request.owner.generation)) return
+        // MediaController accepted the override, but its player may not have
+        // selected that group yet. A synchronous callback may already have
+        // published it; otherwise onTracksChanged will confirm it later.
+        resolveSubtitleRemountReselection(_uiState.value.subtitleTracks)
     }
 
     /**
@@ -4419,22 +4440,6 @@ class TvPlayerViewModel(
         }
     }
 
-    /**
-     * Selects a subtitle by SERVER catalog row index ([PlayerSubtitleInfo.index]),
-     * phone-parity for the HUD/quick-picker menus. Catalog-only rows (blank URL)
-     * have no mounted Media3 track until the V3 planner materializes them, so
-     * the menus must not be keyed off live player tracks. Returns the mounted
-     * Media3 track index when one already exists (caller applies it through the
-     * normal backend path), or null after scheduling a materializing replan
-     * whose track is auto-selected by label once it arrives.
-     */
-    fun onSelectCatalogSubtitle(serverIndex: Int): Int? {
-        val state = _uiState.value
-        val row = state.subtitleUrls.firstOrNull { it.index == serverIndex } ?: return null
-        selectSubtitleOption(tvSubtitleIdentity(row))
-        return null
-    }
-
     fun selectSubtitleOption(identity: SubtitleIdentity) {
         manualSubtitleSelectionApplied = true
         // The viewer is choosing: drop the automatic marker so this commit
@@ -4458,7 +4463,7 @@ class TvPlayerViewModel(
 
     internal fun onSubtitleSelectionFailed(request: TvSubtitleMountRequest) {
         val owner = request.owner
-        subtitleRemountReselection.acknowledgeResolved(owner.generation)
+        if (!subtitleRemountReselection.acknowledgeResolved(owner.generation)) return
         Log.w(
             TV_SUBTITLE_LOG_TAG,
             "Subtitle mount rejected by the player: track=${request.trackIndex} " +
@@ -4493,10 +4498,17 @@ class TvPlayerViewModel(
                 subtitleRows = _uiState.value.subtitleUrls,
                 snapshotKey = snapshotKey,
                 settled = subtitleSnapshotSettlement.observe(subtitle),
+                transportMounted = !transportMountGate.suppressPositionReports,
             )
         ) {
             is TvSubtitleRemountEvent.Select -> _subtitleMountRequests.tryEmit(
                 TvSubtitleMountRequest(owner = event.owner, trackIndex = event.trackIndex),
+            )
+            is TvSubtitleRemountEvent.Confirmed -> subtitleTransactions.reportMountedSelection(
+                identity = event.owner.identity,
+                selected = true,
+                snapshotKey = snapshotKey ?: "tv-subtitles-off:${event.owner.generation}",
+                settled = true,
             )
             is TvSubtitleRemountEvent.Failed -> subtitleTransactions.reportMountedSelection(
                 identity = event.owner.identity,
@@ -4506,10 +4518,6 @@ class TvPlayerViewModel(
             )
             null -> Unit
         }
-    }
-
-    fun onManualSubtitleSelectionIntent(index: Int) {
-        manualSubtitleSelectionApplied = true
     }
 
     fun beginScrub() {
@@ -4570,7 +4578,7 @@ class TvPlayerViewModel(
             controlsVisibleBeforeHud = _uiState.value.showControls
         }
         Log.d(TAG, "hud open (controlsBefore=$controlsVisibleBeforeHud, wasOpen=${_uiState.value.hudOpen})")
-        _uiState.update { it.copy(hudOpen = true, showSubtitleMenu = false, showControls = true) }
+        _uiState.update { it.copy(hudOpen = true, showControls = true) }
     }
 
     fun closeHUD() {
@@ -4578,14 +4586,6 @@ class TvPlayerViewModel(
         _uiState.update {
             it.copy(hudOpen = false, showControls = controlsVisibleBeforeHud)
         }
-    }
-
-    fun openSubtitleMenu() {
-        _uiState.update { it.copy(showSubtitleMenu = true, hudOpen = false, showControls = true) }
-    }
-
-    fun closeSubtitleMenu() {
-        _uiState.update { it.copy(showSubtitleMenu = false) }
     }
 
     fun onVideoFillModeChanged(mode: VideoFillMode) {
@@ -4680,14 +4680,6 @@ class TvPlayerViewModel(
 
     fun closeSubtitleSearchDialog() {
         _uiState.update { it.copy(showSubtitleSearchDialog = false) }
-    }
-
-    fun openSubtitleStyleDialog() {
-        _uiState.update { it.copy(showSubtitleStyleDialog = true) }
-    }
-
-    fun closeSubtitleStyleDialog() {
-        _uiState.update { it.copy(showSubtitleStyleDialog = false) }
     }
 
     fun openAiTranslateDialog() {
@@ -4839,7 +4831,6 @@ class TvPlayerViewModel(
             existing = state.subtitleUrls,
             downloaded = downloaded,
             sessionId = sessionId,
-            serverUrl = state.serverUrl,
         )
         // The adapter's answer, not an assumption. applyRefresh returns false
         // when the refresh lost ownership before it could be applied — so a
@@ -5264,7 +5255,15 @@ class TvPlayerViewModel(
      * prepare). Without this the screen can sit on a stale spinner instead of
      * an actionable error. The error UI offers [retry].
      */
-    fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+    /**
+     * @param servicePlayer the in-process player the error came from, when the
+     * screen has it. The controller-side [error] has lost its renderer
+     * attribution; the service player still knows which renderer failed.
+     */
+    fun onPlayerError(
+        error: androidx.media3.common.PlaybackException,
+        servicePlayer: androidx.media3.common.Player? = null,
+    ) {
         val state = _uiState.value
         val message = error.localizedMessage?.takeIf { msg -> msg.isNotBlank() }
             ?: "Playback failed. Please try again."
@@ -5399,6 +5398,7 @@ class TvPlayerViewModel(
                     message,
                     state,
                     diagnostics = diagnostics,
+                    failedTrackType = error.failedRendererTrackType(servicePlayer),
                 )
             }
             return
