@@ -231,9 +231,10 @@ private fun TvCastCrewDivider(label: String, height: Dp) {
             text = label.uppercase(),
             style = MaterialTheme.typography.labelSmall.copy(
                 fontWeight = FontWeight.SemiBold,
-                fontSize = 12.sp,
-                lineHeight = 14.sp,
-                letterSpacing = 1.5.sp,
+                // TV copy keeps the 14sp readability floor.
+                fontSize = 14.sp,
+                lineHeight = 16.sp,
+                letterSpacing = 1.0.sp,
             ),
             color = Color.White.copy(alpha = 0.6f),
             maxLines = 1,
