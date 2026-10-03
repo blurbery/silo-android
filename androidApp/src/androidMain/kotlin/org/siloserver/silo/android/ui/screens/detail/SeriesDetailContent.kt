@@ -35,6 +35,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.platform.LocalDensity
+import org.siloserver.silo.common.ui.castCrewCredits
 import org.siloserver.silo.common.ui.components.DeferImagePresentationWhileScrolling
 
 /**
@@ -110,6 +111,7 @@ fun SeriesDetailContent(
     // replacing it with a skeleton (and repainting different names) on every
     // horizontal episode selection.
     val fixedSeriesCredit = remember(detail.contentId, detail.cast) { seriesStarringCredit(detail) }
+    val castCrew = remember(detail) { castCrewCredits(detail) }
     val episodeCountSubtitle = selectedSeason?.episodeCount?.takeIf { it > 0 }?.let { count ->
         "$count episode${if (count == 1) "" else "s"}"
     }
@@ -376,12 +378,12 @@ fun SeriesDetailContent(
             }
         }
 
-        if (detail.cast.isNotEmpty()) {
+        if (castCrew.isNotEmpty()) {
             item(contentType = "detail-cast") {
                 Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
                     SectionHeader(title = "Cast & Crew")
                     CastCrewSection(
-                        cast = detail.cast,
+                        credits = castCrew,
                         onPersonClick = onPersonClick,
                     )
                 }
